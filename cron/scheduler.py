@@ -4320,9 +4320,59 @@ def run_job(
                     f"config is pinned or restored. See #44585."
                 )
 
+        runtime_provider = str(runtime.get("provider") or "").strip().lower()
+
+        # ── Fleet cost-saving mode gate (Damien's 2026-07-31 ruling) ────────
+        #
+        # Sits immediately after provider resolution and the #44585 drift
+        # guard, and BEFORE the credential pool / MCP discovery / AIAgent
+        # construction below — so a gated tick makes no inference call and
+        # costs nothing, exactly like the drift skip.
+        #
+        # Modes (canonical: ~/ai-fleet/docs/cost-saving-modes.md):
+        #   3 — every metered provider is skipped, no exceptions.
+        #   2 — metered providers are skipped UNLESS the job is flagged
+        #       ``"critical": true`` in ~/.hermes/cron/jobs.json.
+        #   1 / off — no gating.
+        #
+        # SKIP, never SWAP.  Re-routing a scheduled job onto a cheaper
+        # provider is the exact silent-provider-drift failure the #44585
+        # guard above exists to prevent: an unattended job that quietly
+        # answers from a different model is worse than one that visibly did
+        # not run.  So this is a SILENT SUCCESS (no delivery, no error, loud
+        # log) rather than a raise: a cost mode is an operator's deliberate
+        # pause, not a job failure, and erroring would spam the failure
+        # alerting path on every tick for the whole duration of a lockdown.
+        _cost_mode_file = "~/ai-fleet/cost_mode.json"
+        try:
+            from agent.cost_mode import COST_MODE_FILE as _cost_mode_file
+            from agent.cost_mode import cron_skip_reason as _cost_mode_skip
+            _mode_skip = _cost_mode_skip(
+                runtime_provider, critical=bool(job.get("critical")),
+            )
+        except Exception as _mode_exc:  # fail OPEN — see agent/cost_mode.py
+            logger.debug("Job '%s': cost-mode gate unavailable (%s)", job_id, _mode_exc)
+            _mode_skip = None
+        if _mode_skip:
+            logger.warning(
+                "Job '%s': SKIPPED by cost saving mode — %s. No inference call "
+                "was made. Say 'cost saving mode off' to restore, or flag this "
+                "job critical (`\"critical\": true` in cron/jobs.json) to let it "
+                "run under mode 2. State file: %s",
+                job_id,
+                _mode_skip,
+                _cost_mode_file,
+            )
+            silent_doc = (
+                f"# Cron Job: {job_name}\n\n"
+                f"**Job ID:** {job_id}\n"
+                f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"**Status:** skipped by cost saving mode ({_mode_skip})\n"
+            )
+            return True, silent_doc, SILENT_MARKER, None
+
         fallback_model = get_fallback_chain(_cfg) or None
         credential_pool = None
-        runtime_provider = str(runtime.get("provider") or "").strip().lower()
         if runtime_provider:
             try:
                 from agent.credential_pool import load_pool

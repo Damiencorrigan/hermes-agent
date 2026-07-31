@@ -31,6 +31,10 @@ from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
 from agent.error_classifier import FailoverReason
 from agent.errors import EmptyStreamError
+from agent.cost_mode import (
+    enforce_cost_saving_mode,
+    fallback_skip_reason as cost_mode_fallback_skip,
+)
 from agent.turn_context import substitute_api_content
 from agent.gemini_native_adapter import is_native_gemini_base_url
 from agent.model_metadata import is_local_endpoint
@@ -865,6 +869,12 @@ def interruptible_api_call(agent, api_kwargs: dict):
     the main retry loop can try again with backoff / credential rotation /
     provider fallback.
     """
+    # Fleet cost-saving mode 3 = lockdown: refuse a metered provider before a
+    # client is built or a worker thread spawned, so a locked-down lane costs
+    # nothing at all. (Adapted from f60738a3b — the original sat beside the
+    # primary spend cap, which does not exist on this main.)
+    enforce_cost_saving_mode(agent)
+
     # Cron and other non-interactive, nested-pool contexts must not spawn the
     # interrupt worker — it wedges before the socket opens on the 2nd+ call
     # (#62151). Run inline instead. See should_use_direct_api_call.
@@ -1997,6 +2007,22 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         )
         return agent._try_activate_fallback(reason)
 
+    # Fleet cost-saving mode 3 (lockdown): every metered rung refuses, so the
+    # chain exhausts instead of quietly landing the session on another paid
+    # lane. Checked before the backend-identity logic so a lockdown cannot be
+    # routed around by failing over. (Adapted from f60738a3b.)
+    mode_skip_reason = cost_mode_fallback_skip(fb_provider)
+    if mode_skip_reason:
+        unavailable.add(fb_key)
+        logger.warning(
+            "Fallback skip: %s/%s blocked by fleet cost-saving mode 3 (%s); "
+            "suppressing for this session",
+            fb_provider,
+            fb_model,
+            mode_skip_reason,
+        )
+        return agent._try_activate_fallback(reason)
+
     # Skip entries that resolve to the same backend that just failed —
     # falling back to it loops the failure. Identity semantics (which axes
     # distinguish two backends, shim aliases, first-class credential
@@ -2774,6 +2800,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     Falls back to _interruptible_api_call on provider errors indicating
     streaming is not supported.
     """
+    # Fleet cost-saving mode 3 = lockdown: refuse a metered provider before a
+    # client is built. Sibling of the check in interruptible_api_call; the
+    # branches below that delegate to the non-streaming entry re-check, which
+    # is harmless (the verdict is a ~60s-cached file read).
+    enforce_cost_saving_mode(agent)
+
     if agent._interrupt_requested:
         raise InterruptedError("Agent interrupted before streaming API call")
 

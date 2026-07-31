@@ -660,6 +660,22 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         _plugin_section_blocks(_frozen_plugin_prompt_sections(agent), "after_memory")
     )
 
+    # Fleet cost-saving mode banner (Damien's 2026-07-31 ruling). Silent in the
+    # normal "off" state, so an ordinary session's prompt is byte-identical to
+    # before. Lives in the VOLATILE tier on purpose: a mode change must not
+    # invalidate the upstream prompt cache for the stable/context tiers, and a
+    # session that starts under a mode should see it from turn one.
+    # The mode is also ENFORCED (mode 3 refuses metered calls outright, cron
+    # jobs are gated) — this line exists so the agent can EXPLAIN the refusal
+    # and degrade loudly rather than discovering it as an opaque 402.
+    try:
+        from agent.cost_mode import session_banner as _cost_mode_banner
+        _mode_line = _cost_mode_banner()
+    except Exception:
+        _mode_line = None
+    if _mode_line:
+        volatile_parts.append(_mode_line)
+
     from hermes_time import now as _hermes_now
     now = _hermes_now()
     # Date-only (not minute-precision) so the system prompt is byte-stable
