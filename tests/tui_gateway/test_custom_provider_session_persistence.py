@@ -27,6 +27,8 @@ import json
 import types
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 import hermes_cli.runtime_provider as rp
 
 MIMO_URL = "https://token-plan-cn.xiaomimimo.com/v1"
@@ -340,6 +342,55 @@ class TestModelNameRecoversEntryIdentity:
         assert (
             rp.find_custom_provider_identity_by_model("hermes-ultra-sft")
             == "custom:hermes-ultra"
+        )
+
+
+# --- Regression: cron-context OpenRouter resolution must FAIL LOUD ----------
+#
+# 2026-08-12 incident: 68+ "No LLM provider configured" failures in 48h across
+# the trove profile's Scout cron jobs (model=openai/gpt-5.6-luna via
+# provider=openrouter — e.g. 'Scout Whatnot batch executor' failing at 21:25
+# while the SAME job succeeded at 21:17). When OPENROUTER_API_KEY is absent AND
+# the credential pool has no usable entry (payment/credit errors mark entries
+# exhausted), resolve_runtime_provider returned a KEYLESS runtime pointing at
+# the OpenRouter default — provider="openrouter",
+# base_url="https://openrouter.ai/api/v1", api_key="" — and the agent build
+# later died with the generic "No LLM provider configured. Run `hermes model`"
+# message, which is actively misleading. A paid cloud endpoint must NEVER be
+# resolved keyless: fail loud AT RESOLUTION, naming the provider and profile,
+# so the cron job's error line is diagnosable.
+CRON_OPENROUTER_CONFIG = {
+    "model": {"default": "openai/gpt-5.6-luna", "provider": "openrouter"},
+    "providers": {},
+}
+
+
+class TestCronOpenRouterKeylessFallthroughFailsLoud:
+    def test_openrouter_without_key_raises_specific_error(self, monkeypatch):
+        """The cron path: requested='openrouter' with no env key, no config
+        key, and no usable credential-pool entry. Must raise a SPECIFIC error
+        naming the provider and profile — never return the keyless
+        OpenRouter-default runtime that surfaces as the generic message."""
+        monkeypatch.setenv("HERMES_PROFILE", "trove")
+        monkeypatch.setattr(rp, "load_config", lambda: CRON_OPENROUTER_CONFIG)
+        monkeypatch.setattr(rp, "_get_model_config", lambda: CRON_OPENROUTER_CONFIG["model"])
+        monkeypatch.setattr(rp, "_getenv", lambda k, d="": d)
+        monkeypatch.setattr(rp, "load_pool", lambda provider: None)
+        monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openrouter")
+
+        from hermes_cli.auth import AuthError
+
+        with pytest.raises(AuthError) as excinfo:
+            rp.resolve_runtime_provider(
+                requested="openrouter",
+                target_model="openai/gpt-5.6-luna",
+            )
+
+        msg = str(excinfo.value)
+        assert "openrouter" in msg, "specific error must name the provider"
+        assert "trove" in msg, "specific error must name the profile"
+        assert "No LLM provider configured" not in msg, (
+            "must not surface the generic 'run hermes model' message"
         )
 
 

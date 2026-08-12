@@ -1302,6 +1302,40 @@ def _resolve_openrouter_runtime(
     if effective_provider == "custom" and not api_key and not _is_openrouter_url:
         api_key = "no-key-required"
 
+    # Fail loud, never fail vague: a paid cloud endpoint (OpenRouter) resolved
+    # with NO api_key must never be returned as a keyless runtime pointing at
+    # the OpenRouter default — downstream that surfaces as the misleading
+    # generic "No LLM provider configured. Run `hermes model`..." message.
+    # 2026-08-12 incident: 68+ such failures in 48h across the trove profile's
+    # Scout cron jobs (model=openai/gpt-5.6-luna via provider=openrouter): the
+    # OpenRouter credential pool had no usable entry (payment/credit errors
+    # mark entries exhausted) and OPENROUTER_API_KEY was absent, so resolution
+    # returned provider=openrouter / api_key="" and every job died with the
+    # generic message. A local no-auth endpoint stays legal via the
+    # "no-key-required" placeholder above; OpenRouter is a paid cloud endpoint
+    # and ALWAYS needs a key. Raising AuthError (the sibling api_key-provider
+    # convention, code="missing_api_key") lets callers route to their fallback
+    # chain, and when no fallback exists the specific error names the provider
+    # and profile so the cron job's error line is diagnosable. Scoped to
+    # _is_openrouter_url (host-match) so keyless resolution stays legal for
+    # custom endpoints, mirrors, and local no-auth servers — only the actual
+    # OpenRouter cloud requires a key.
+    if effective_provider == "openrouter" and not api_key and _is_openrouter_url:
+        _profile = (
+            os.environ.get("HERMES_PROFILE")
+            or os.environ.get("HERMES_PROFILE_NAME")
+            or "default"
+        )
+        raise AuthError(
+            f"No usable OpenRouter API key for provider 'openrouter' "
+            f"(profile: {_profile}): OPENROUTER_API_KEY is not set, the config "
+            f"has no api_key, and the credential pool has no usable entry — "
+            f"refusing to fall through to the OpenRouter default without a key "
+            f"(fail loud, never fail vague).",
+            provider="openrouter",
+            code="missing_api_key",
+        )
+
     return {
         "provider": effective_provider,
         "api_mode": _resolve_plain_custom_api_mode(model_cfg, base_url)
