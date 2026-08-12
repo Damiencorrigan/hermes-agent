@@ -404,6 +404,14 @@ def test_resolve_runtime_provider_openrouter_explicit_api_key_skips_pool(monkeyp
 
 
 def test_resolve_runtime_provider_openrouter_ignores_codex_config_base_url(monkeypatch):
+    """requested=openrouter + keyless must FAIL LOUD, not return the keyless
+    OpenRouter-default runtime.
+
+    2026-08-12 regression: the old contract returned provider=openrouter with
+    api_key=\"\" pointing at the OpenRouter default, which surfaced downstream
+    as the misleading generic \"No LLM provider configured. Run `hermes model`\"
+    message in cron jobs. A paid cloud endpoint resolved keyless now raises
+    AuthError naming the provider (openrouter)."""
     monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openrouter")
     monkeypatch.setattr(
         rp,
@@ -418,10 +426,12 @@ def test_resolve_runtime_provider_openrouter_ignores_codex_config_base_url(monke
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
 
-    resolved = rp.resolve_runtime_provider(requested="openrouter")
+    from hermes_cli.auth import AuthError
 
-    assert resolved["provider"] == "openrouter"
-    assert resolved["base_url"] == rp.OPENROUTER_BASE_URL
+    with pytest.raises(AuthError) as excinfo:
+        rp.resolve_runtime_provider(requested="openrouter")
+
+    assert "openrouter" in str(excinfo.value)
 
 
 def test_resolve_runtime_provider_auto_uses_custom_config_base_url(monkeypatch):
