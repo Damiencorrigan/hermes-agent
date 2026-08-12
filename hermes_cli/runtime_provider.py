@@ -20,6 +20,7 @@ from agent.credential_pool import (
 )
 from agent.secret_scope import get_secret as _get_secret
 from hermes_cli.auth import (
+    ACTUAL_LOCAL_NOAUTH_PLACEHOLDER,
     AuthError,
     DEFAULT_CODEX_BASE_URL,
     DEFAULT_QWEN_BASE_URL,
@@ -36,6 +37,8 @@ from hermes_cli.auth import (
     resolve_api_key_provider_credentials,
     resolve_external_process_provider_credentials,
     has_usable_secret,
+    is_actual_local_base_url,
+    normalize_actual_base_url,
 )
 from hermes_cli.config import (
     get_compatible_custom_providers,
@@ -130,6 +133,8 @@ def _detect_api_mode_for_url(base_url: str) -> Optional[str]:
     # surface, same Responses-API mandate. Shared predicate — see
     # providers.is_official_openai_host for the spoof-rejection contract.
     if is_official_openai_host(base_url):
+        return "codex_responses"
+    if hostname == "api.actual.inc":
         return "codex_responses"
     # Direct native Anthropic host: realign with providers.determine_api_mode,
     # which already maps this host to anthropic_messages. The exact-hostname
@@ -1302,6 +1307,40 @@ def _resolve_openrouter_runtime(
     if effective_provider == "custom" and not api_key and not _is_openrouter_url:
         api_key = "no-key-required"
 
+    # Fail loud, never fail vague: a paid cloud endpoint (OpenRouter) resolved
+    # with NO api_key must never be returned as a keyless runtime pointing at
+    # the OpenRouter default — downstream that surfaces as the misleading
+    # generic "No LLM provider configured. Run `hermes model`..." message.
+    # 2026-08-12 incident: 68+ such failures in 48h across the trove profile's
+    # Scout cron jobs (model=openai/gpt-5.6-luna via provider=openrouter): the
+    # OpenRouter credential pool had no usable entry (payment/credit errors
+    # mark entries exhausted) and OPENROUTER_API_KEY was absent, so resolution
+    # returned provider=openrouter / api_key="" and every job died with the
+    # generic message. A local no-auth endpoint stays legal via the
+    # "no-key-required" placeholder above; OpenRouter is a paid cloud endpoint
+    # and ALWAYS needs a key. Raising AuthError (the sibling api_key-provider
+    # convention, code="missing_api_key") lets callers route to their fallback
+    # chain, and when no fallback exists the specific error names the provider
+    # and profile so the cron job's error line is diagnosable. Scoped to
+    # _is_openrouter_url (host-match) so keyless resolution stays legal for
+    # custom endpoints, mirrors, and local no-auth servers — only the actual
+    # OpenRouter cloud requires a key.
+    if effective_provider == "openrouter" and not api_key and _is_openrouter_url:
+        _profile = (
+            os.environ.get("HERMES_PROFILE")
+            or os.environ.get("HERMES_PROFILE_NAME")
+            or "default"
+        )
+        raise AuthError(
+            f"No usable OpenRouter API key for provider 'openrouter' "
+            f"(profile: {_profile}): OPENROUTER_API_KEY is not set, the config "
+            f"has no api_key, and the credential pool has no usable entry — "
+            f"refusing to fall through to the OpenRouter default without a key "
+            f"(fail loud, never fail vague).",
+            provider="openrouter",
+            code="missing_api_key",
+        )
+
     return {
         "provider": effective_provider,
         "api_mode": _resolve_plain_custom_api_mode(model_cfg, base_url)
@@ -1607,12 +1646,17 @@ def _resolve_explicit_runtime(
             else:
                 base_url = env_url or pconfig.inference_base_url
 
+        if provider == "actual":
+            base_url = normalize_actual_base_url(base_url)
+
         api_key = explicit_api_key
         if not api_key:
             creds = resolve_api_key_provider_credentials(provider)
             api_key = creds.get("api_key", "")
             if not base_url:
                 base_url = creds.get("base_url", "").rstrip("/")
+                if provider == "actual":
+                    base_url = normalize_actual_base_url(base_url)
 
         api_mode = "chat_completions"
         if provider == "copilot":
@@ -1622,6 +1666,8 @@ def _resolve_explicit_runtime(
                 target_model=target_model,
             )
         elif provider == "xai":
+            api_mode = "codex_responses"
+        elif provider == "actual":
             api_mode = "codex_responses"
         else:
             configured_provider = str(model_cfg.get("provider") or "").strip().lower()
@@ -1634,6 +1680,9 @@ def _resolve_explicit_runtime(
                 api_mode = _fallback_api_mode(
                     provider, base_url, target_model or model_cfg.get("default", "")
                 )
+
+        if provider == "actual" and not api_key and is_actual_local_base_url(base_url):
+            api_key = ACTUAL_LOCAL_NOAUTH_PLACEHOLDER
 
         return {
             "provider": provider,
@@ -2173,6 +2222,22 @@ def resolve_runtime_provider(
     pconfig = PROVIDER_REGISTRY.get(provider)
     if pconfig and pconfig.auth_type == "api_key":
         creds = resolve_api_key_provider_credentials(provider)
+        # Actual Computer: a loopback base_url configured in model_cfg (not
+        # just env) selects the daemon's local offline API, which requires no
+        # auth. Inject the placeholder BEFORE the usable-secret gate below,
+        # mirroring the env-driven path inside the credential resolver.
+        if provider == "actual" and not has_usable_secret(creds.get("api_key")):
+            _cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
+            _cfg_url = ""
+            if _cfg_provider == provider:
+                _cfg_url = (model_cfg.get("base_url") or "").strip().rstrip("/")
+            _effective_url = normalize_actual_base_url(
+                _cfg_url or creds.get("base_url", "").rstrip("/")
+            )
+            if is_actual_local_base_url(_effective_url):
+                creds = dict(creds)
+                creds["api_key"] = ACTUAL_LOCAL_NOAUTH_PLACEHOLDER
+                creds["source"] = creds.get("source") or "local-offline"
         # An explicitly selected API-key provider is authoritative. Returning
         # a runtime with an empty key defers failure until the first request and
         # can make a later fallback look like a silent provider switch. Fail at
@@ -2196,6 +2261,8 @@ def resolve_runtime_provider(
         if cfg_provider == provider:
             cfg_base_url = (model_cfg.get("base_url") or "").strip().rstrip("/")
         base_url = cfg_base_url or creds.get("base_url", "").rstrip("/")
+        if provider == "actual":
+            base_url = normalize_actual_base_url(base_url)
         api_mode = "chat_completions"
         if provider == "copilot":
             api_mode = _copilot_runtime_api_mode(
@@ -2204,6 +2271,8 @@ def resolve_runtime_provider(
                 target_model=target_model,
             )
         elif provider == "xai":
+            api_mode = "codex_responses"
+        elif provider == "actual":
             api_mode = "codex_responses"
         else:
             configured_provider = str(model_cfg.get("provider") or "").strip().lower()
@@ -2236,11 +2305,14 @@ def resolve_runtime_provider(
             base_url = normalize_opencode_base_url(provider, api_mode, base_url)
         if provider == "lmstudio":
             base_url = auth_mod._normalize_lmstudio_runtime_base_url(base_url)
+        api_key = creds.get("api_key", "")
+        if provider == "actual" and not api_key and is_actual_local_base_url(base_url):
+            api_key = ACTUAL_LOCAL_NOAUTH_PLACEHOLDER
         return {
             "provider": provider,
             "api_mode": api_mode,
             "base_url": base_url,
-            "api_key": creds.get("api_key", ""),
+            "api_key": api_key,
             "source": creds.get("source", "env"),
             "requested_provider": requested_provider,
         }

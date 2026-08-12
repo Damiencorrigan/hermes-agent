@@ -26,6 +26,47 @@ from typing import Callable, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
 
+# Cap on a tool error body; only trims runaway interpolated exceptions (static msgs are ~115 chars).
+_MAX_TOOL_ERROR_CHARS = 2048
+_TOOL_ERROR_TRUNCATION_MARKER = "… [truncated]"
+# Logs keep more of the body than the model sees, but still a bounded amount.
+_MAX_LOGGED_ERROR_CHARS = 8192
+
+
+def _bound_error_text(text: str) -> str:
+    """Bound an error body destined for model context; logs keep a longer prefix."""
+    if len(text) <= _MAX_TOOL_ERROR_CHARS:
+        return text
+    logger.debug(
+        "tool error body truncated for context (%d chars): %s",
+        len(text),
+        text[:_MAX_LOGGED_ERROR_CHARS],
+    )
+    return text[:_MAX_TOOL_ERROR_CHARS] + _TOOL_ERROR_TRUNCATION_MARKER
+
+
+def _bound_json_error_result(result: str) -> str:
+    """Trim an oversized ``error`` field in a JSON string result.
+
+    Handlers that serialize exceptions directly — ``json.dumps({"error":
+    str(exc), ...})`` instead of ``tool_error()`` — bypass the cap in
+    ``tool_error``. Applied at the dispatch boundary so no registered tool
+    can return an unbounded error body that stacks across retries.
+    """
+    if len(result) <= _MAX_TOOL_ERROR_CHARS or '"error"' not in result:
+        return result
+    try:
+        payload = json.loads(result)
+    except ValueError:
+        return result
+    if not isinstance(payload, dict):
+        return result
+    error = payload.get("error")
+    if not isinstance(error, str) or len(error) <= _MAX_TOOL_ERROR_CHARS:
+        return result
+    payload["error"] = _bound_error_text(error)
+    return json.dumps(payload, ensure_ascii=False)
+
 
 def _is_registry_register_call(node: ast.AST) -> bool:
     """Return True when *node* is a ``registry.register(...)`` call expression."""
@@ -344,6 +385,30 @@ def invalidate_check_fn_cache() -> None:
     with _check_fn_cache_lock:
         _check_fn_cache.clear()
         _check_fn_last_good.clear()
+
+
+def get_cached_check_fn_result(fn: Callable) -> Optional[bool]:
+    """Return the current cached verdict for *fn* if its TTL is still valid.
+
+    Unlike :func:`_check_fn_cached`, this NEVER executes the probe. It is for
+    read-only surfaces (e.g. dashboard status panels) that need the last-known
+    availability without triggering network / auth / SDK work inside a request
+    path. Returns ``None`` when there is no fresh cached verdict.
+    """
+    now = time.monotonic()
+    scope = check_fn_cache_scope()
+    if scope == CHECK_FN_CACHE_BYPASS:
+        # Unresolved profile identity bypasses the cache entirely; there is no
+        # trustworthy cached verdict to report.
+        return None
+    with _check_fn_cache_lock:
+        cached = _check_fn_cache.get((fn, scope))
+        if cached is None:
+            return None
+        ts, value = cached
+        if now - ts < _CHECK_FN_TTL_SECONDS:
+            return value
+        return None
 
 
 class ToolRegistry:
@@ -712,7 +777,7 @@ class ToolRegistry:
         persistence from receiving values they cannot safely slice or size.
         """
         if isinstance(result, str):
-            return result
+            return _bound_json_error_result(result)
         if (
             isinstance(result, dict)
             and result.get("_multimodal") is True
@@ -753,7 +818,10 @@ class ToolRegistry:
                 result = entry.handler(args, **kwargs)
             return self._normalize_handler_result(name, result)
         except Exception as e:
-            logger.exception("Tool %s dispatch error: %s", name, e)
+            # exc_info already renders the exception, so keep the message copy bounded.
+            logger.exception(
+                "Tool %s dispatch error: %s", name, _bound_error_text(str(e))
+            )
             # Route through the sanitizer so framing tokens / CDATA / fences
             # in exception strings don't reach the model as structural noise.
             # See model_tools._sanitize_tool_error for rationale.
@@ -911,7 +979,8 @@ def tool_error(message, **extra) -> str:
     >>> tool_error("bad input", success=False)
     '{"error": "bad input", "success": false}'
     """
-    result = {"error": str(message)}
+    # Bound the context-bound copy so a raw exception can't bloat history across retries.
+    result = {"error": _bound_error_text(str(message))}
     if extra:
         result.update(extra)
     return json.dumps(result, ensure_ascii=False)

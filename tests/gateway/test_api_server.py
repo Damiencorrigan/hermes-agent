@@ -209,7 +209,7 @@ class TestAdapterInit:
         )
         monkeypatch.setattr(
             "gateway.run.GatewayRunner._load_reasoning_config",
-            staticmethod(lambda: {"enabled": True, "effort": "xhigh"}),
+            staticmethod(lambda model="": {"enabled": True, "effort": "xhigh"}),
         )
         monkeypatch.setattr("gateway.run.GatewayRunner._load_fallback_model", staticmethod(lambda: None))
         monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", lambda *_: set())
@@ -913,6 +913,7 @@ class TestToolsetsEndpoint:
             ("default", "Default Tools", "Core tools"),
             ("web", "Web Tools", "Search and extract"),
         ]
+        feature_snapshot = object()
         with patch(
             "hermes_cli.tools_config._get_effective_configurable_toolsets",
             return_value=fake_toolsets,
@@ -920,9 +921,12 @@ class TestToolsetsEndpoint:
             "hermes_cli.tools_config._get_platform_tools",
             return_value={"default"},
         ), patch(
+            "hermes_cli.tools_config.get_nous_subscription_features",
+            return_value=feature_snapshot,
+        ) as resolve_features, patch(
             "hermes_cli.tools_config._toolset_has_keys",
             return_value=True,
-        ), patch(
+        ) as has_keys, patch(
             "toolsets.resolve_toolset",
             side_effect=lambda name: {
                 "default": ["terminal", "read_file"],
@@ -942,6 +946,13 @@ class TestToolsetsEndpoint:
                 assert by_name["web"]["enabled"] is False
                 assert by_name["web"]["tools"] == ["web_search"]
                 assert by_name["default"]["configured"] is True
+
+        resolve_features.assert_called_once()
+        assert has_keys.call_count == len(fake_toolsets)
+        assert all(
+            call.kwargs["features"] is feature_snapshot
+            for call in has_keys.call_args_list
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1663,13 +1674,15 @@ class TestResponsesStreaming:
 
         # Patch web.StreamResponse for the duration of the writer call.
         import gateway.platforms.api_server as api_mod
-        import queue as _q
 
-        stream_q: _q.Queue = _q.Queue()
+        # The SSE writers consume an asyncio queue (ThreadSafeAsyncQueue),
+        # not a plain queue.Queue — a stdlib queue would block the drain
+        # loop's ``await stream_q.get()`` forever.
+        stream_q = api_mod.ThreadSafeAsyncQueue()
 
         async def _agent_coro():
             # Feed one partial delta into the stream queue...
-            stream_q.put("partial output")
+            stream_q.put_nowait("partial output")
             # ...then give the drain loop a moment to pick it up before
             # raising CancelledError to simulate a server-side cancel.
             await asyncio.sleep(0.01)
@@ -1734,11 +1747,12 @@ class TestResponsesStreaming:
                     raise ConnectionResetError("simulated client disconnect")
 
         import gateway.platforms.api_server as api_mod
-        import queue as _q
 
-        stream_q: _q.Queue = _q.Queue()
-        stream_q.put("some streamed text")
-        stream_q.put(None)  # EOS sentinel
+        # asyncio queue to match the writers' consumer (see the note in
+        # test_stream_cancelled_persists_incomplete_snapshot).
+        stream_q = api_mod.ThreadSafeAsyncQueue()
+        stream_q.put_nowait("some streamed text")
+        stream_q.put_nowait(None)  # EOS sentinel
 
         async def _agent_coro():
             await asyncio.sleep(0.01)
@@ -2019,9 +2033,15 @@ class TestToolCallsInOutput:
             assert output[0]["name"] == "calculator"
             assert output[0]["arguments"] == '{"expression": "6*7"}'
             assert output[0]["call_id"] == "call_abc123"
+            # Replayed server-executed calls must be marked completed so
+            # OpenAI clients don't treat them as pending calls to execute.
+            assert output[0]["status"] == "completed"
+            assert output[0]["id"].startswith("fc_")
             assert output[1]["type"] == "function_call_output"
             assert output[1]["call_id"] == "call_abc123"
             assert output[1]["output"] == "42"
+            assert output[1]["status"] == "completed"
+            assert output[1]["id"].startswith("fco_")
             assert output[2]["type"] == "message"
             assert output[2]["content"][0]["text"] == "The result is 42."
 
@@ -2845,5 +2865,4 @@ class TestCreateAgentModelRecovery:
         )
         adapter._create_agent(session_id="another-session", gateway_session_key="stable-chan-1")
         assert captured[1]["model"] == "minimax/minimax-m3"
-
 

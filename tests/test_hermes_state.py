@@ -78,6 +78,24 @@ def db(tmp_path):
     session_db.close()
 
 
+@pytest.fixture(autouse=True)
+def _no_fts_rebuild_throttle(monkeypatch):
+    """Zero the FTS-rebuild inter-chunk throttle for every test in this file.
+
+    ``optimize_fts_storage`` sleeps ``max(_FTS_REBUILD_MIN_PAUSE,
+    chunk_cost * _FTS_REBUILD_DUTY_FACTOR)`` between chunks so a LIVE
+    gateway/CLI sharing the DB isn't starved of the write lock. Tests run
+    against a private tmp-path DB with no concurrent process — the sleep
+    protects nobody and was pure dead time (measured: 4.1s of a 4.6s
+    migration test was time.sleep; ~20s across the file, whose total was
+    ~52s). The duty-cycle POLICY (sleep >= 4x chunk cost) stays covered by
+    the production constants themselves; no test asserts on wall-clock
+    pacing.
+    """
+    monkeypatch.setattr(SessionDB, "_FTS_REBUILD_MIN_PAUSE", 0.0)
+    monkeypatch.setattr(SessionDB, "_FTS_REBUILD_DUTY_FACTOR", 0.0)
+
+
 # =========================================================================
 # Connection lifecycle
 # =========================================================================
@@ -656,12 +674,66 @@ class TestFTS5Search:
         assert isinstance(results[0]["context"], list)
         assert len(results[0]["context"]) > 0
 
+    def test_search_fields_project_results_without_changing_default(self, db):
+        db.create_session(session_id="s1", source="cli")
+        db.append_message("s1", role="user", content="Tell me about Kubernetes")
+        db.append_message("s1", role="assistant", content="Kubernetes is an orchestrator.")
 
+        projected = db.search_messages(
+            "Kubernetes", fields=("session_id", "role", "snippet")
+        )
+        default = db.search_messages("Kubernetes")
 
+        assert len(projected) == len(default) == 2
+        assert all(set(row) == {"session_id", "role", "snippet"} for row in projected)
+        assert [
+            (row["session_id"], row["role"], row["snippet"])
+            for row in projected
+        ] == [
+            (row["session_id"], row["role"], row["snippet"])
+            for row in default
+        ]
+        assert all("context" in row and row["context"] for row in default)
 
+    def test_search_projection_skips_context_enrichment_queries(self, db):
+        db.create_session(session_id="s1", source="cli")
+        db.append_message("s1", role="user", content="before")
+        db.append_message("s1", role="assistant", content="projectionneedle")
+        db.append_message("s1", role="user", content="after")
 
+        statements = []
+        read_conn = db._get_read_conn() or db._conn
+        traced_connections = [db._conn]
+        if read_conn is not db._conn:
+            traced_connections.append(read_conn)
+        for conn in traced_connections:
+            conn.set_trace_callback(statements.append)
 
+        def context_query_count():
+            normalized = (" ".join(sql.upper().split()) for sql in statements)
+            return sum("WITH TARGET AS (" in sql for sql in normalized)
 
+        try:
+            projected = db.search_messages(
+                "projectionneedle", fields=("session_id", "snippet")
+            )
+            assert len(projected) == 1
+            assert context_query_count() == 0
+
+            full = db.search_messages(
+                "projectionneedle", fields=("session_id", "context")
+            )
+            assert len(full) == 1
+            assert full[0]["context"]
+            assert context_query_count() == 1
+
+            default = db.search_messages("projectionneedle")
+            assert len(default) == 1
+            assert default[0]["context"]
+            assert context_query_count() == 2
+        finally:
+            for conn in traced_connections:
+                conn.set_trace_callback(None)
 
     def test_sanitize_fts5_query_strips_dangerous_chars(self):
         """Unit test for _sanitize_fts5_query static method."""
@@ -815,6 +887,22 @@ class TestCounts:
 
 
 
+
+    def test_session_count_ge_empty(self, db):
+        """session_count_ge should return False for 0 sessions."""
+        assert db.session_count_ge(1) is False
+        assert db.session_count_ge(2) is False
+
+    def test_session_count_ge_at_threshold(self, db):
+        """session_count_ge should True when count >= n."""
+        db.create_session("s1", "cli")
+        assert db.session_count_ge(1) is True
+        assert db.session_count_ge(2) is False
+
+        db.create_session("s2", "telegram")
+        assert db.session_count_ge(1) is True
+        assert db.session_count_ge(2) is True
+        assert db.session_count_ge(3) is False
 
     def test_message_count_total(self, db):
         assert db.message_count() == 0
@@ -997,6 +1085,99 @@ class TestPruneSessionFilters:
 
 
 
+
+    def test_title_like_underscore_is_literal_not_a_wildcard(self, db):
+        """``_`` is a single-character wildcard in SQL LIKE, so an unescaped
+        filter deletes sessions the operator never selected. The filters are
+        documented (and shown in the CLI confirmation) as substring matches.
+        """
+        self._mk(db, "target", title="user_auth refactor")
+        self._mk(db, "bystander1", title="user-auth review")
+        self._mk(db, "bystander2", title="userXauth notes")
+        self._mk(db, "bystander3", title="user auth meeting")
+
+        rows = db.list_prune_candidates(title_like="user_auth")
+        assert {r["id"] for r in rows} == {"target"}
+
+        pruned = db.prune_sessions(older_than_days=None, title_like="user_auth")
+        assert pruned == 1
+        for survivor in ("bystander1", "bystander2", "bystander3"):
+            assert db.get_session(survivor) is not None
+
+    def test_percent_in_filter_does_not_select_everything(self, db):
+        """``%`` matches any run of characters — a bare one would delete the
+        whole table."""
+        self._mk(db, "a", title="alpha")
+        self._mk(db, "b", title="beta")
+        self._mk(db, "pct", title="100% coverage run")
+
+        # Only the title that really contains a percent sign matches.
+        assert {r["id"] for r in db.list_prune_candidates(title_like="%")} == {"pct"}
+        assert {r["id"] for r in db.list_prune_candidates(title_like="100%")} == {"pct"}
+
+    def test_branch_like_underscore_is_literal(self, db):
+        """Branch names carry underscores routinely."""
+        self._mk_rich(db, "want", git_branch="fix/session_prune")
+        self._mk_rich(db, "other", git_branch="fix/session-prune")
+
+        rows = db.list_prune_candidates(branch_like="session_prune")
+        assert {r["id"] for r in rows} == {"want"}
+
+    def test_model_like_underscore_is_literal(self, db):
+        self._mk_rich(db, "want", model="vendor/model_mini")
+        self._mk_rich(db, "other", model="vendor/model-mini")
+
+        rows = db.list_prune_candidates(model_like="model_mini")
+        assert {r["id"] for r in rows} == {"want"}
+
+    def test_plain_substring_filters_still_match(self, db):
+        """Guard against over-escaping: ordinary filters keep working, and a
+        literal backslash in the needle is matched as itself."""
+        self._mk(db, "smoke", title="Codex Smoke Test")
+        self._mk_rich(db, "winpath", title=r"build C:\tmp artifacts")
+
+        assert {r["id"] for r in db.list_prune_candidates(title_like="smoke")} == {"smoke"}
+        assert {r["id"] for r in db.list_prune_candidates(title_like=r"c:\tmp")} == {"winpath"}
+
+    def test_cwd_prefix_underscore_is_literal_not_a_wildcard(self, db):
+        """``_`` is a LIKE wildcard but an ordinary character in a path, so an
+        unescaped prefix also matched a same-length sibling directory — and
+        prune_sessions deletes what it matches."""
+        self._mk(db, "target", cwd="/home/me/my_project/src")
+        self._mk(db, "sibling", cwd="/home/me/myXproject/src")
+
+        rows = db.list_prune_candidates(cwd_prefix="/home/me/my_project")
+        assert {r["id"] for r in rows} == {"target"}
+
+        pruned = db.prune_sessions(older_than_days=None, cwd_prefix="/home/me/my_project")
+        assert pruned == 1
+        assert db.get_session("sibling") is not None
+
+    def test_cwd_prefix_percent_does_not_select_everything(self, db):
+        self._mk(db, "a", cwd="/home/me/one")
+        self._mk(db, "b", cwd="/home/me/two")
+
+        assert db.list_prune_candidates(cwd_prefix="/home/me/%") == []
+
+    def test_cwd_prefix_still_matches_the_directory_and_its_children(self, db):
+        """Control: the prefix must keep matching itself and anything under it."""
+        self._mk(db, "root", cwd="/home/me/proj")
+        self._mk(db, "child", cwd="/home/me/proj/src")
+        self._mk(db, "outside", cwd="/home/me/other")
+
+        rows = db.list_prune_candidates(cwd_prefix="/home/me/proj")
+        assert {r["id"] for r in rows} == {"root", "child"}
+
+    def test_cwd_prefix_windows_separator_arm(self, db):
+        """The backslash child arm (``{esc}\\\\%`` in the pattern) must keep
+        matching Windows children while ``_`` stays literal — a guard against
+        'simplifying' the quadruple backslash."""
+        self._mk(db, "win_root", cwd=r"C:\Users\me\my_project")
+        self._mk(db, "win_child", cwd=r"C:\Users\me\my_project\src")
+        self._mk(db, "win_sibling", cwd=r"C:\Users\me\myXproject\src")
+
+        rows = db.list_prune_candidates(cwd_prefix=r"C:\Users\me\my_project")
+        assert {r["id"] for r in rows} == {"win_root", "win_child"}
 
     def test_unknown_filter_rejected(self, db):
         import pytest as _pytest
@@ -1834,6 +2015,88 @@ class TestCompressionChainProjection:
         assert tip_row["preview"].startswith("latest message")
         assert tip_row["ended_at"] is None  # tip is still live
         assert tip_row["end_reason"] is None
+
+    def test_list_projects_multiple_independent_chains_in_one_call(self, db):
+        """Two unrelated compression chains in the same page must each
+        resolve to their own tip, not get cross-mixed by the batched tip-row
+        fetch (regression test for the single-query batch in
+        _get_session_rich_rows_batch — a wrong id->row mapping there would
+        silently swap one chain's data onto the other)."""
+        import time as _time
+
+        t0 = _time.time() - 7200
+        self._build_compression_chain(db, t0)
+
+        # Second, independent chain — same shape, different ids/content.
+        db.create_session("root2", "cli")
+        db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0 + 100, "root2"))
+        db.append_message("root2", "user", "second conversation start")
+        db._conn.execute(
+            "UPDATE sessions SET ended_at=?, end_reason=? WHERE id=?",
+            (t0 + 200, "compression", "root2"),
+        )
+        db.create_session("tip2", "cli", parent_session_id="root2")
+        db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0 + 201, "tip2"))
+        db.append_message("tip2", "user", "second conversation continuation")
+        db.update_session_cwd("tip2", "/tmp/workspaces/second")
+        db._conn.commit()
+
+        sessions = db.list_sessions_rich(source="cli", limit=20)
+        ids = [s["id"] for s in sessions]
+        assert "root1" not in ids and "root2" not in ids
+        assert "tip1" in ids and "tip2" in ids
+
+        tip1_row = next(s for s in sessions if s["id"] == "tip1")
+        tip2_row = next(s for s in sessions if s["id"] == "tip2")
+        assert tip1_row["_lineage_root_id"] == "root1"
+        assert tip1_row["preview"].startswith("latest message")
+        assert tip2_row["_lineage_root_id"] == "root2"
+        assert tip2_row["preview"].startswith("second conversation continuation")
+        assert tip2_row["cwd"] == "/tmp/workspaces/second"
+
+    def test_list_batches_tip_row_fetch_into_one_query(self, db, monkeypatch):
+        """Projection must resolve tip rows for a whole page in one batched
+        query, not one _get_session_rich_row() call per compression root."""
+        import time as _time
+
+        t0 = _time.time() - 7200
+        self._build_compression_chain(db, t0)
+        db.create_session("root2", "cli")
+        db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0 + 100, "root2"))
+        db.append_message("root2", "user", "second conversation start")
+        db._conn.execute(
+            "UPDATE sessions SET ended_at=?, end_reason=? WHERE id=?",
+            (t0 + 200, "compression", "root2"),
+        )
+        db.create_session("tip2", "cli", parent_session_id="root2")
+        db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0 + 201, "tip2"))
+        db.append_message("tip2", "user", "second continuation")
+        db._conn.commit()
+
+        batch_calls = []
+        single_calls = []
+        original_batch = db._get_session_rich_rows_batch
+        original_single = db._get_session_rich_row
+
+        def counting_batch(session_ids, **kwargs):
+            batch_calls.append(list(session_ids))
+            return original_batch(session_ids, **kwargs)
+
+        def counting_single(session_id, **kwargs):
+            single_calls.append(session_id)
+            return original_single(session_id, **kwargs)
+
+        monkeypatch.setattr(db, "_get_session_rich_rows_batch", counting_batch)
+        monkeypatch.setattr(db, "_get_session_rich_row", counting_single)
+
+        sessions = db.list_sessions_rich(source="cli", limit=20)
+        assert len(sessions) >= 2  # sanity: both chains actually surfaced
+
+        # Two compression roots resolved with exactly one batched call, and
+        # zero single-row calls — not one single-row call per root.
+        assert len(batch_calls) == 1
+        assert set(batch_calls[0]) == {"tip1", "tip2"}
+        assert single_calls == []
 
 
 
@@ -2774,6 +3037,120 @@ class TestFTSExternalContentMigration:
         finally:
             db.close()
 
+    def test_fts_teardown_single_key_high_water_drains_and_drops(self, tmp_path):
+        """#79324: single-column-key trash tables drain via a high-water
+        marker so each chunk only scans rows after the previous chunk.
+
+        Builds a large trash table with a rowid-like integer PK, then drives
+        ``_fts_teardown_trash_step`` to completion. Verifies every row is
+        removed, the marker advances monotonically, the marker is cleared,
+        and the table is dropped at the end.
+        """
+        db = SessionDB(db_path=tmp_path / "trash.db")
+        try:
+            conn = db._conn
+            # A plain trash table shaped like a demoted FTS shadow table
+            # (single integer PK — the common, large-table shape).
+            conn.execute(
+                "CREATE TABLE fts_v22_trash_messages_fts_data "
+                "(docid INTEGER PRIMARY KEY, block BLOB)"
+            )
+            conn.executemany(
+                "INSERT INTO fts_v22_trash_messages_fts_data "
+                "(docid, block) VALUES (?, ?)",
+                [(i, b"x" * 64) for i in range(1, 2501)],
+            )
+            conn.commit()
+
+            assert db._has_fts_trash(conn) is True
+
+            steps = 0
+            while db._fts_teardown_trash_step():
+                steps += 1
+                assert steps < 100, "teardown never finished"
+
+            # All rows gone, table dropped, marker cleaned up.
+            assert db._has_fts_trash(conn) is False
+            assert conn.execute(
+                "SELECT name FROM sqlite_master WHERE name = "
+                "'fts_v22_trash_messages_fts_data'"
+            ).fetchone() is None
+            assert db.get_meta("fts_teardown_fts_v22_trash_messages_fts_data_progress") is None
+            # Multiple chunks were needed (2500 rows / 500 chunk).
+            assert steps >= 5
+        finally:
+            db.close()
+
+    def test_fts_teardown_high_water_resumes_after_interruption(self, tmp_path):
+        """#79324: the high-water marker survives an interrupted teardown,
+        so the next call resumes from the marker instead of the table start."""
+        db = SessionDB(db_path=tmp_path / "trash.db")
+        try:
+            conn = db._conn
+            conn.execute(
+                "CREATE TABLE fts_v22_trash_messages_fts_data "
+                "(docid INTEGER PRIMARY KEY, block BLOB)"
+            )
+            conn.executemany(
+                "INSERT INTO fts_v22_trash_messages_fts_data "
+                "(docid, block) VALUES (?, ?)",
+                [(i, b"x" * 64) for i in range(1, 1201)],
+            )
+            conn.commit()
+
+            # Drain two chunks, then simulate a crash: the marker stays at
+            # the last drained key and the remaining rows are intact.
+            assert db._fts_teardown_trash_step() is True
+            assert db._fts_teardown_trash_step() is True
+            marker = db.get_meta("fts_teardown_fts_v22_trash_messages_fts_data_progress")
+            assert marker is not None
+            assert int(marker) == 1000  # 2 chunks x 500 rows
+
+            remaining = conn.execute(
+                "SELECT COUNT(*) FROM fts_v22_trash_messages_fts_data"
+            ).fetchone()[0]
+            assert remaining == 200
+
+            # Resume: drains the rest, drops the table.
+            while db._fts_teardown_trash_step():
+                pass
+            assert db._has_fts_trash(conn) is False
+            assert db.get_meta("fts_teardown_fts_v22_trash_messages_fts_data_progress") is None
+        finally:
+            db.close()
+
+    def test_fts_teardown_compound_key_keeps_legacy_path(self, tmp_path):
+        """#79324: multi-column-PK trash tables (small by construction) keep
+        the legacy chunked delete — the high-water path only applies to
+        single-column keys."""
+        db = SessionDB(db_path=tmp_path / "trash.db")
+        try:
+            conn = db._conn
+            conn.execute(
+                "CREATE TABLE fts_v22_trash_messages_fts_idx "
+                "(segid INTEGER, term TEXT, pgno INTEGER, "
+                "PRIMARY KEY (segid, term, pgno)) WITHOUT ROWID"
+            )
+            conn.executemany(
+                "INSERT INTO fts_v22_trash_messages_fts_idx "
+                "(segid, term, pgno) VALUES (?, ?, ?)",
+                [(i % 3, f"term-{i}", i) for i in range(20)],
+            )
+            conn.commit()
+
+            steps = 0
+            while db._fts_teardown_trash_step():
+                steps += 1
+                assert steps < 10
+
+            assert db._has_fts_trash(conn) is False
+            assert conn.execute(
+                "SELECT name FROM sqlite_master WHERE name = "
+                "'fts_v22_trash_messages_fts_idx'"
+            ).fetchone() is None
+        finally:
+            db.close()
+
 
 
 # ---------------------------------------------------------------------------
@@ -3119,6 +3496,41 @@ def test_gateway_session_peer_round_trip_and_recovery(db):
     assert recovered["id"] == "gw-session"
 
 
+@pytest.mark.parametrize(
+    "persisted_session_key",
+    ["agent:main:telegram:dm:chat-1", None],
+    ids=["exact-key", "peer-fallback"],
+)
+def test_gateway_session_recovery_does_not_cross_newer_reset_boundary(
+    db, persisted_session_key
+):
+    """A newer session_reset row fences recovery for the peer (#68539).
+
+    Recovery must never reach *behind* an intentional /new boundary and
+    resurrect an older still-open row — if the newest boundary row for the
+    peer is reset-ended, recovery returns nothing.
+    """
+    peer = {
+        "user_id": "user-1",
+        "session_key": persisted_session_key,
+        "chat_id": "chat-1",
+        "chat_type": "dm",
+    }
+    db.create_session("gw-before-reset", "telegram", **peer)
+    db.append_message("gw-before-reset", "user", "old context")
+    db.create_session("gw-reset", "telegram", **peer)
+    db.append_message("gw-reset", "user", "/new")
+    db.end_session("gw-reset", "session_reset")
+
+    assert db.find_latest_gateway_session_for_peer(
+        source="telegram",
+        user_id="user-1",
+        session_key="agent:main:telegram:dm:chat-1",
+        chat_id="chat-1",
+        chat_type="dm",
+    ) is None
+
+
 
 
 
@@ -3262,6 +3674,48 @@ class TestCompactRows:
         assert "system_prompt" not in row
         assert row["id"] == "s1"
 
+    def test_batch_compact_rows_omits_system_prompt_keeps_git_fields(self, db):
+        """_get_session_rich_rows_batch(compact_rows=True) must apply the same
+        schema-derived compact projection as the single-row path: no
+        system_prompt blob, but git_branch/git_repo_root still present."""
+        self._create(db, "s1", system_prompt="should be gone")
+        db.update_session_cwd("s1", "/tmp/w1", git_branch="main", git_repo_root="/tmp/w1")
+        rows = db._get_session_rich_rows_batch(["s1"], compact_rows=True)
+        assert set(rows) == {"s1"}
+        row = rows["s1"]
+        assert "system_prompt" not in row
+        assert row["git_branch"] == "main"
+        assert row["git_repo_root"] == "/tmp/w1"
+
+    def test_compression_tip_projection_threads_compact_rows(self, db):
+        """list_sessions_rich(compact_rows=True) must thread compact_rows
+        through the batched tip-row fetch: the projected tip row must lack
+        system_prompt but keep git metadata (guards the call site at the
+        projection loop, not just the batch helper)."""
+        import time as _time
+
+        t0 = _time.time() - 3600
+        db.create_session("rootc", "cli")
+        db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0, "rootc"))
+        db.append_message("rootc", "user", "start")
+        db._conn.execute(
+            "UPDATE sessions SET ended_at=?, end_reason=? WHERE id=?",
+            (t0 + 100, "compression", "rootc"),
+        )
+        db.create_session("tipc", "cli", parent_session_id="rootc")
+        db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0 + 101, "tipc"))
+        db.append_message("tipc", "user", "continuation")
+        db.update_system_prompt("tipc", "big blob " * 500)
+        db.update_session_cwd("tipc", "/tmp/w2", git_branch="dev", git_repo_root="/tmp/w2")
+        db._conn.commit()
+
+        rows = db.list_sessions_rich(source="cli", compact_rows=True)
+        tip = next(s for s in rows if s["id"] == "tipc")
+        assert tip["_lineage_root_id"] == "rootc"
+        assert "system_prompt" not in tip
+        assert tip["git_branch"] == "dev"
+        assert tip["git_repo_root"] == "/tmp/w2"
+
 
 
 
@@ -3277,8 +3731,19 @@ class TestGetMessagesPagination:
 
     def _seed(self, db, n=10):
         db.create_session(session_id="s1", source="cli")
-        for i in range(n):
-            db.append_message("s1", "user" if i % 2 == 0 else "assistant", f"msg-{i}")
+        # One write transaction for the whole seed: per-row append_message
+        # pays a commit (and, off WAL, an fsync) per message, which at
+        # n=3000 was ~10s of pure seeding before the query under test ran.
+        db.append_messages_batch(
+            "s1",
+            [
+                {
+                    "role": "user" if i % 2 == 0 else "assistant",
+                    "content": f"msg-{i}",
+                }
+                for i in range(n)
+            ],
+        )
 
     def test_default_returns_all_messages(self, db):
         self._seed(db)
@@ -3335,6 +3800,114 @@ class TestGetMessagesPagination:
         assert [m["content"] for m in page1] == ["msg-0", "msg-1", "msg-2", "msg-3"]
         assert [m["content"] for m in page2] == ["msg-4", "msg-5", "msg-6", "msg-7"]
         assert [m["content"] for m in page3] == ["msg-8", "msg-9"]
+
+    def test_latest_pages_count_back_from_newest_but_remain_chronological(self, db):
+        self._seed(db)
+        page1 = db.get_messages("s1", limit=4, offset=0, latest=True)
+        page2 = db.get_messages("s1", limit=4, offset=4, latest=True)
+        page3 = db.get_messages("s1", limit=4, offset=8, latest=True)
+        assert [m["content"] for m in page1] == ["msg-6", "msg-7", "msg-8", "msg-9"]
+        assert [m["content"] for m in page2] == ["msg-2", "msg-3", "msg-4", "msg-5"]
+        assert [m["content"] for m in page3] == ["msg-0", "msg-1"]
+
+    def test_after_id_keyset_pages_forward_in_insertion_order(self, db):
+        self._seed(db)
+        page1 = db.get_messages("s1", limit=4, after_id=0)
+        assert [m["content"] for m in page1] == ["msg-0", "msg-1", "msg-2", "msg-3"]
+        page2 = db.get_messages("s1", limit=4, after_id=page1[-1]["id"])
+        assert [m["content"] for m in page2] == ["msg-4", "msg-5", "msg-6", "msg-7"]
+        page3 = db.get_messages("s1", limit=4, after_id=page2[-1]["id"])
+        assert [m["content"] for m in page3] == ["msg-8", "msg-9"]
+        with pytest.raises(ValueError):
+            db.get_messages("s1", limit=4, after_id=0, latest=True)
+        with pytest.raises(ValueError):
+            db.get_messages("s1", limit=4, after_id=0, offset=2)
+
+    def test_resume_safety_counts_active_rows_across_lineage(self, db):
+        db.create_session(session_id="root", source="cli")
+        db.append_messages_batch(
+            "root",
+            [{"role": "user", "content": f"root-{i}"} for i in range(3)],
+        )
+        db.create_session(
+            session_id="tip",
+            source="compression",
+            parent_session_id="root",
+        )
+        db.append_messages_batch(
+            "tip",
+            [{"role": "assistant", "content": f"tip-{i}"} for i in range(2)],
+        )
+
+        assert db.get_resume_message_count("tip") == 5
+        with pytest.raises(hermes_state.SessionResumeTooLargeError) as exc_info:
+            db.assert_resume_safe("tip", max_messages=4)
+        assert exc_info.value.message_count == 5
+        assert exc_info.value.limit == 4
+
+    def test_export_safety_is_bounded_to_the_requested_active_segment(self, db):
+        db.create_session(session_id="root", source="cli")
+        db.append_messages_batch(
+            "root",
+            [{"role": "user", "content": f"root-{i}"} for i in range(3)],
+        )
+        db.create_session(
+            session_id="tip",
+            source="compression",
+            parent_session_id="root",
+        )
+        db.append_messages_batch(
+            "tip",
+            [{"role": "assistant", "content": f"tip-{i}"} for i in range(2)],
+        )
+
+        assert db.assert_export_safe("tip", max_messages=2) == 2
+        with pytest.raises(hermes_state.SessionExportTooLargeError) as exc_info:
+            db.assert_export_safe("root", max_messages=2)
+        assert exc_info.value.session_id == "root"
+        assert exc_info.value.message_count == 3
+        assert exc_info.value.limit == 2
+
+    def test_zero_limit_disables_resume_and_export_guards(self, db, monkeypatch):
+        """sessions.max_*_messages: 0 disables the guard entirely."""
+        db.create_session(session_id="big", source="cli")
+        db.append_messages_batch(
+            "big",
+            [{"role": "user", "content": f"msg-{i}"} for i in range(5)],
+        )
+
+        # A small explicit limit rejects...
+        with pytest.raises(hermes_state.SessionResumeTooLargeError):
+            db.assert_resume_safe("big", max_messages=2)
+        with pytest.raises(hermes_state.SessionExportTooLargeError):
+            db.assert_export_safe("big", max_messages=2)
+
+        # ...but a config-resolved limit of 0 disables both guards: no raise,
+        # and no counting work at all (returns 0 — callers use the raise side
+        # effect only).
+        monkeypatch.setattr(hermes_state, "resolved_max_resume_messages", lambda: 0)
+        monkeypatch.setattr(hermes_state, "resolved_max_export_messages", lambda: 0)
+        assert db.assert_resume_safe("big") == 0
+        assert db.assert_export_safe("big") == 0
+        # An explicit 0 disables too, independent of config.
+        assert db.assert_resume_safe("big", max_messages=0) == 0
+        assert db.assert_export_safe("big", max_messages=0) == 0
+
+    def test_guard_limits_resolve_from_config_at_call_time(self, db, monkeypatch):
+        db.create_session(session_id="cfg", source="cli")
+        db.append_messages_batch(
+            "cfg",
+            [{"role": "user", "content": f"msg-{i}"} for i in range(4)],
+        )
+
+        monkeypatch.setattr(hermes_state, "resolved_max_resume_messages", lambda: 3)
+        monkeypatch.setattr(hermes_state, "resolved_max_export_messages", lambda: 3)
+        with pytest.raises(hermes_state.SessionResumeTooLargeError) as resume_exc:
+            db.assert_resume_safe("cfg")
+        assert resume_exc.value.limit == 3
+        with pytest.raises(hermes_state.SessionExportTooLargeError) as export_exc:
+            db.assert_export_safe("cfg")
+        assert export_exc.value.limit == 3
 
 
 
@@ -3641,3 +4214,410 @@ class TestApplyDatabasePragmas:
             assert conn.execute("PRAGMA wal_autocheckpoint").fetchone()[0] == before
         finally:
             conn.close()
+
+    def test_ignores_non_integer_performance_values(self, tmp_path, monkeypatch):
+        """Garbage cache_size/mmap_size/temp_store values must be rejected."""
+        import sqlite3
+        from hermes_state import apply_database_pragmas
+
+        conn = sqlite3.connect(str(tmp_path / "pragmas.db"))
+        try:
+            before = {
+                name: conn.execute(f"PRAGMA {name}").fetchone()[0]
+                for name in ("cache_size", "mmap_size", "temp_store")
+            }
+            self._patch_cfg(
+                monkeypatch,
+                {
+                    "database": {
+                        "cache_size": "big",
+                        "mmap_size": [256],
+                        "temp_store": "ram please",
+                    }
+                },
+            )
+            apply_database_pragmas(conn, db_label="test.db")
+            after = {
+                name: conn.execute(f"PRAGMA {name}").fetchone()[0]
+                for name in ("cache_size", "mmap_size", "temp_store")
+            }
+            assert after == before
+        finally:
+            conn.close()
+
+
+class TestInsightsToolCallIndex:
+    """The Insights assistant tool-call scan has a predicate-aligned index.
+
+    ``InsightsEngine._get_tool_usage`` / ``_get_skill_usage`` filter messages by
+    ``role = 'assistant' AND tool_calls IS NOT NULL``.  A partial index over that
+    predicate keeps the scan off the full ``messages`` table on a large state.db.
+    """
+
+    _INDEX = "idx_messages_assistant_calls_by_session"
+
+    def _index_defn(self, conn):
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+            (self._INDEX,),
+        ).fetchone()
+        return row["sql"] if row else None
+
+    def test_index_created_on_fresh_db(self, tmp_path):
+        db = SessionDB(db_path=tmp_path / "fresh.db")
+        try:
+            sql = self._index_defn(db._conn)
+            assert sql is not None, "partial index missing on a fresh database"
+            # Partial predicate must match the queried rows exactly.
+            assert "role = 'assistant'" in sql
+            assert "tool_calls IS NOT NULL" in sql
+        finally:
+            db.close()
+
+    def test_index_created_on_existing_db(self, tmp_path):
+        """Reopening a DB that predates the index must create it (SCHEMA_SQL is
+        re-run on every open; role/tool_calls are original base columns)."""
+        db_path = tmp_path / "legacy.db"
+        db = SessionDB(db_path=db_path)
+        # Simulate a database created before the index shipped.
+        db._conn.execute(f"DROP INDEX IF EXISTS {self._INDEX}")
+        db._conn.commit()
+        assert self._index_defn(db._conn) is None
+        db.close()
+
+        db2 = SessionDB(db_path=db_path)
+        try:
+            assert self._index_defn(db2._conn) is not None, (
+                "index not recreated when reopening an existing database"
+            )
+        finally:
+            db2.close()
+
+    def test_index_predicate_is_partial(self, db):
+        """The index covers only the assistant tool-call rows Insights reads.
+
+        Query-plan coverage (that the Insights queries actually select this
+        index, for both scopes, without ANALYZE) lives with the queries in
+        tests/agent/test_insights.py.
+        """
+        sql = self._index_defn(db._conn)
+        assert sql is not None
+        assert "WHERE" in sql
+        assert "role = 'assistant'" in sql
+        assert "tool_calls IS NOT NULL" in sql
+class TestFtsRebuildFinishWithoutTrigram:
+    """An FTS index that the runtime cannot maintain must not wedge the store.
+
+    Two independent failure sites shared one root shape: code that writes to
+    ``messages_fts_trigram`` without first checking the table is actually
+    present. It is legitimately absent whenever the trigram index is
+    unavailable (SQLite build without the tokenizer), and it can also be left
+    absent by an interrupted migration or a partially-applied schema change.
+    """
+
+    @staticmethod
+    def _seed(db_path, n=60):
+        seeded = SessionDB(db_path=db_path)
+        try:
+            seeded.create_session(session_id="s1", source="cli")
+            for i in range(n):
+                seeded.append_message(
+                    "s1",
+                    role=("user" if i % 3 == 0
+                          else "assistant" if i % 3 == 1 else "tool"),
+                    content=f"sentinel payload {i} zebra",
+                )
+            high_water = seeded._conn.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM messages"
+            ).fetchone()[0]
+        finally:
+            seeded.close()
+        return high_water
+
+    def test_rebuild_finish_skips_trigram_when_unavailable(
+        self, tmp_path, monkeypatch
+    ):
+        """optimize_fts_storage() completes when the trigram index is absent.
+
+        ``fts_rebuild_step()`` already guards its backfill INSERT on
+        ``_trigram_available``; ``_fts_rebuild_finish()``'s boundary sweep did
+        not, so finishing a deferred rebuild on a trigram-less runtime raised
+        ``no such table: messages_fts_trigram`` and aborted the whole
+        optimization. The base index must still be swept and the markers
+        cleared.
+        """
+        db_path = tmp_path / "state.db"
+        high_water = self._seed(db_path)
+
+        real_connect = sqlite3.connect
+
+        def connect_without_trigram(*args, **kwargs):
+            kwargs["factory"] = _NoTrigramConnection
+            return real_connect(*args, **kwargs)
+
+        monkeypatch.setattr(
+            "hermes_state.sqlite3.connect", connect_without_trigram
+        )
+        db = SessionDB(db_path=db_path)
+        try:
+            assert db._trigram_available is False
+            # A trigram-less runtime leaves no trigram index on disk.
+            db._conn.execute("DROP TABLE IF EXISTS messages_fts_trigram")
+            db._conn.commit()
+            assert db._fts_table_exists("messages_fts_trigram") is False
+
+            # Put the DB in the pending-deferred-rebuild state.
+            for key, value in (
+                ("fts_rebuild_high_water", str(high_water)),
+                ("fts_rebuild_progress", str(high_water)),
+            ):
+                db._conn.execute(
+                    "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (key, value),
+                )
+            db._conn.commit()
+
+            # Pre-fix this raised OperationalError("no such table: ...").
+            db._fts_rebuild_finish()
+
+            # The sweep ran to completion: markers cleared…
+            assert db.get_meta("fts_rebuild_high_water") is None
+            assert db.get_meta("fts_rebuild_progress") is None
+            # …and the base index is still usable (the fix must not disable
+            # real search to dodge the error).
+            assert db.search_messages("zebra")
+        finally:
+            db.close()
+
+    def test_optimize_fts_storage_succeeds_without_trigram(
+        self, tmp_path, monkeypatch
+    ):
+        """End-to-end: the public optimize entry point returns ok=True."""
+        db_path = tmp_path / "state.db"
+        high_water = self._seed(db_path)
+
+        real_connect = sqlite3.connect
+
+        def connect_without_trigram(*args, **kwargs):
+            kwargs["factory"] = _NoTrigramConnection
+            return real_connect(*args, **kwargs)
+
+        monkeypatch.setattr(
+            "hermes_state.sqlite3.connect", connect_without_trigram
+        )
+        db = SessionDB(db_path=db_path)
+        try:
+            db._conn.execute("DROP TABLE IF EXISTS messages_fts_trigram")
+            db._conn.commit()
+            assert db._trigram_available is False
+            for key, value in (
+                ("fts_rebuild_high_water", str(high_water)),
+                ("fts_rebuild_progress", "0"),
+            ):
+                db._conn.execute(
+                    "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (key, value),
+                )
+            db._conn.commit()
+
+            result = db.optimize_fts_storage(vacuum=False)
+            assert result["ok"] is True
+            assert db.get_meta("fts_rebuild_high_water") is None
+            assert db.search_messages("zebra")
+        finally:
+            db.close()
+
+
+
+class TestPerformancePragmasEndToEnd:
+    """E2E guard for PR #71755: config-gated cache_size / mmap_size /
+    temp_store must reach EVERY connection type (writer, read-only
+    cross-profile attach, WAL per-thread reader) — and default installs
+    (no ``database:`` keys) must see byte-identical SQLite defaults.
+
+    NOTE: SQLite's compiled-in default for ``cache_size`` is already
+    ``-2000``, so the configured value here is ``-16000`` — a value the
+    test can actually discriminate from the default (a reverted prod
+    change must FAIL this test, not accidentally pass it).
+    """
+
+    PRAGMAS = ("cache_size", "mmap_size", "temp_store")
+    CONFIGURED = {"cache_size": -16000, "mmap_size": 1048576, "temp_store": 2}
+
+    @staticmethod
+    def _read(conn):
+        return {
+            name: conn.execute(f"PRAGMA {name}").fetchone()[0]
+            for name in ("cache_size", "mmap_size", "temp_store")
+        }
+
+    @staticmethod
+    def _sqlite_defaults(tmp_path):
+        import sqlite3
+
+        conn = sqlite3.connect(str(tmp_path / "baseline.db"))
+        try:
+            return {
+                name: conn.execute(f"PRAGMA {name}").fetchone()[0]
+                for name in ("cache_size", "mmap_size", "temp_store")
+            }
+        finally:
+            conn.close()
+
+    def _fresh_home(self, tmp_path, monkeypatch, config_text=None):
+        import hermes_state
+
+        # Local venvs may bundle a WAL-reset-vulnerable SQLite (e.g. 3.46.0),
+        # which would silently disable WAL and skip the per-thread reader
+        # path. Force WAL eligibility so _get_read_conn is truly exercised
+        # (established pattern used by the WAL tests above).
+        monkeypatch.setattr(
+            hermes_state,
+            "is_sqlite_wal_reset_vulnerable",
+            lambda version_info=None: False,
+        )
+        home = tmp_path / "hermes_home"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        if config_text is not None:
+            (home / "config.yaml").write_text(config_text)
+        return home
+
+    def test_configured_pragmas_reach_all_connection_types(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_state import SessionDB
+
+        home = self._fresh_home(
+            tmp_path,
+            monkeypatch,
+            "database:\n"
+            "  cache_size: -16000\n"
+            "  temp_store: 2\n"
+            "  mmap_size: 1048576\n",
+        )
+        db_path = home / "state.db"
+        db = SessionDB(db_path=db_path)
+        try:
+            # Writer connection.
+            assert self._read(db._conn) == self.CONFIGURED
+            # WAL per-thread reader.
+            rconn = db._get_read_conn()
+            assert rconn is not None, "WAL reader expected on local filesystem"
+            assert self._read(rconn) == self.CONFIGURED
+        finally:
+            db.close()
+
+        # Read-only cross-profile attach.
+        ro = SessionDB(db_path=db_path, read_only=True)
+        try:
+            assert self._read(ro._conn) == self.CONFIGURED
+        finally:
+            ro.close()
+
+    def test_defaults_unchanged_without_config(self, tmp_path, monkeypatch):
+        """No database: keys in config.yaml → SQLite defaults untouched."""
+        from hermes_state import SessionDB
+
+        defaults = self._sqlite_defaults(tmp_path)
+        home = self._fresh_home(tmp_path, monkeypatch, config_text=None)
+        db_path = home / "state.db"
+        db = SessionDB(db_path=db_path)
+        try:
+            assert self._read(db._conn) == defaults
+            rconn = db._get_read_conn()
+            if rconn is not None:
+                assert self._read(rconn) == defaults
+        finally:
+            db.close()
+
+        ro = SessionDB(db_path=db_path, read_only=True)
+        try:
+            assert self._read(ro._conn) == defaults
+        finally:
+            ro.close()
+
+
+class TestFts5SanitizerCharacterClass:
+    """Every character FTS5 rejects outside a quoted phrase must be stripped.
+
+    A survivor reaches MATCH raw and raises, which the execute site swallows
+    into zero results — so the search silently finds nothing rather than
+    erroring. Assertions run the sanitized text against a real FTS5 table.
+    """
+
+    @staticmethod
+    def _fts_table():
+        import sqlite3
+
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE VIRTUAL TABLE t USING fts5(content)")
+        conn.execute(
+            "INSERT INTO t (content) VALUES "
+            "('meet me at user host about gateway run py it s 50 a b')"
+        )
+        return conn
+
+    @staticmethod
+    def _sanitize(query):
+        from hermes_state_search import SessionSearchMixin
+
+        return SessionSearchMixin._sanitize_fts5_query(query)
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "it's",                 # apostrophe — ordinary prose
+            "gateway/run.py",       # path separator
+            "user@host",            # email / handle
+            "a,b",                  # comma
+            "why?",                 # question mark
+            "e=mc2",                # equals
+            "a;b", "a!b", "a&b", "a|b", "x~y",
+            "#tag", "$dollar", "[bracket]", "<tag>",
+            r"C:\path\file",        # backslash
+        ],
+    )
+    def test_query_stays_parsable(self, query):
+        conn = self._fts_table()
+        sanitized = self._sanitize(query)
+        if not sanitized.strip():
+            return
+        # Raises sqlite3.OperationalError if a special character survived.
+        conn.execute("SELECT count(*) FROM t WHERE t MATCH ?", (sanitized,)).fetchone()
+
+    def test_plain_terms_are_untouched(self):
+        assert self._sanitize("hello world").split() == ["hello", "world"]
+
+    def test_quoted_phrase_survives(self):
+        assert '"exact phrase"' in self._sanitize('"exact phrase"')
+
+    def test_hyphen_dotted_term_still_quoted(self):
+        # Step 5's behaviour must not regress: my-app.config.ts stays one term.
+        assert '"my-app.config.ts"' in self._sanitize("my-app.config.ts")
+
+    def test_prefix_star_still_works(self):
+        conn = self._fts_table()
+        sanitized = self._sanitize("gate*")
+        rows = conn.execute(
+            "SELECT count(*) FROM t WHERE t MATCH ?", (sanitized,)
+        ).fetchone()
+        assert rows[0] == 1
+
+    def test_percent_stripped_for_non_cjk_query(self):
+        # % is kept only for the CJK LIKE fallback; a non-CJK query never
+        # reaches that fallback, so % must be stripped before MATCH.
+        conn = self._fts_table()
+        sanitized = self._sanitize("50%")
+        assert "%" not in sanitized
+        conn.execute(
+            "SELECT count(*) FROM t WHERE t MATCH ?", (sanitized,)
+        ).fetchone()
+
+    def test_percent_preserved_for_cjk_query(self):
+        # The CJK LIKE fallback builds its own pattern from the sanitized
+        # text; keep % intact there (pre-existing contract).
+        sanitized = self._sanitize("完成50%")
+        assert "%" in sanitized

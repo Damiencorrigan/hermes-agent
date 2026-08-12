@@ -33,10 +33,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from hermes_cli.timeouts import get_provider_request_timeout
+from agent.message_sanitization import _FULL_ARGS_LOG_BOUND
 from agent.prompt_builder import format_steer_marker
 from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
 from agent.trajectory import convert_scratchpad_to_think
-from agent.credential_pool import STATUS_EXHAUSTED
+from agent.credential_pool import STATUS_EXHAUSTED, credential_pool_matches_provider
 from agent.error_classifier import FailoverReason
 from agent.turn_context import drop_stale_api_content
 from utils import base_url_host_matches, base_url_hostname, env_var_enabled, atomic_json_write
@@ -98,7 +99,7 @@ def _ra():
 
 
 AGENT_RUNTIME_POST_HOOK_TOOL_NAMES = frozenset(
-    {"todo", "session_search", "memory", "clarify", "read_terminal", "delegate_task"}
+    {"todo", "session_search", "memory", "clarify", "read_terminal", "read_preview", "read_window_below", "delegate_task"}
 )
 
 
@@ -385,10 +386,19 @@ def sanitize_tool_call_arguments(
                 # itself becomes an orphan (#58168).
                 tool_call_id = _ra().AIAgent._get_tool_call_id_static(tool_call) or None
                 function_name = function.get("name", "?")
-                preview = arguments[:80]
+                # Log the FULL original argument string (bounded), not an
+                # 80-char preview: this branch is about to overwrite the
+                # only copy of these bytes in the transcript with "{}", and
+                # for a truncated write_file/patch call the destroyed
+                # arguments contain real user content (#80498 — streamed
+                # file content survived only as a log preview). A corrupted
+                # call is rare, so the oversized WARNING is a fair price for
+                # making the data recoverable from agent.log.
+                preview = arguments[:_FULL_ARGS_LOG_BOUND]
                 log.warning(
                     "Corrupted tool_call arguments repaired before request "
-                    "(session=%s, message_index=%s, tool_call_id=%s, function=%s, preview=%r)",
+                    "(session=%s, message_index=%s, tool_call_id=%s, function=%s, "
+                    "original_arguments=%r)",
                     session_id or "-",
                     message_index,
                     tool_call_id or "-",
@@ -1020,6 +1030,13 @@ def recover_with_credential_pool(
         }
         if _credential_id:
             kwargs["credential_id"] = _credential_id
+        # Hand the pool the classified semantics, not just the status. A
+        # billing 403 (OpenRouter "key limit exceeded", xAI spending limit)
+        # and an edge-throttle 403 are the same number but need opposite
+        # cooldowns — the pool can only tell them apart if we say which.
+        # ``effective_reason`` is resolved below; this closure runs after.
+        if effective_reason is not None:
+            kwargs["failure_reason"] = effective_reason.value
         return pool.mark_exhausted_and_rotate(**kwargs)
 
     effective_reason = classified_reason
@@ -1464,6 +1481,64 @@ def restore_primary_runtime(agent) -> bool:
     if getattr(agent, "_rate_limited_until", 0) > time.monotonic():
         return False  # primary still in rate-limit cooldown, stay on fallback
 
+    # ── Reset-aware gate ──
+    # The 60s ``_rate_limited_until`` cooldown covers transient rate limits,
+    # but subscription-style providers (Claude Pro/Max 5-hour windows, ChatGPT
+    # weekly limits) report reset times hours or days away.  The credential
+    # pool already stores those timestamps (``last_error_reset_at``); until
+    # the earliest one elapses, every restore attempt is a *guaranteed*
+    # failure that costs two prompt-cache invalidations per turn (switch to
+    # primary, fail, switch back to fallback) and re-marshals the full
+    # context each way.  Skip the restore while the pool says nobody can
+    # serve, and come back the moment the reset time passes.
+    #
+    # Fail-open by design: any error (unreadable auth store, legacy pool
+    # adapter without ``next_available_at``) falls through to the existing
+    # every-turn retry.  A pool with no reset info returns ``None`` and also
+    # falls through — this gate only ever *adds* skips for provably
+    # limited windows, so recovery can never be later than it is today.
+    #
+    # When the attached pool belongs to the fallback provider (cross-provider
+    # fallback rebinds it), the primary pool is loaded here and handed to the
+    # pool-rebind block below via ``prefetched_primary_pool`` so the load
+    # happens at most once per restore.
+    prefetched_primary_pool = None
+    try:
+        primary_provider = str(
+            (agent._primary_runtime or {}).get("provider") or ""
+        ).strip().lower()
+        pool = getattr(agent, "_credential_pool", None)
+        if not credential_pool_matches_provider(
+            pool,
+            primary_provider,
+            base_url=str((agent._primary_runtime or {}).get("base_url") or ""),
+        ):
+            from agent.credential_pool import load_pool
+
+            prefetched_primary_pool = (
+                load_pool(primary_provider) if primary_provider else None
+            )
+            pool = prefetched_primary_pool
+        next_at = getattr(pool, "next_available_at", lambda: None)()
+        if next_at is not None and next_at > time.time():
+            if not getattr(agent, "_restore_wait_logged", False):
+                agent._restore_wait_logged = True
+                logger.info(
+                    "Primary %s rate-limited until %s; staying on fallback "
+                    "%s/%s until the reset elapses",
+                    primary_provider or "?",
+                    datetime.fromtimestamp(next_at).isoformat(timespec="seconds"),
+                    agent.provider,
+                    agent.model,
+                )
+            return False
+    except Exception:
+        logger.debug(
+            "Reset-aware restore gate failed; falling back to per-turn retry",
+            exc_info=True,
+        )
+    agent._restore_wait_logged = False
+
     rt = agent._primary_runtime
     try:
         # ── Core runtime state ──
@@ -1557,9 +1632,14 @@ def restore_primary_runtime(agent) -> bool:
             agent._credential_pool = None
             agent._credential_pool_entry_id = None
             try:
-                from agent.credential_pool import load_pool
+                if prefetched_primary_pool is not None:
+                    # Reuse the pool the reset-aware gate already loaded for
+                    # this restore — avoids a second disk read of auth.json.
+                    agent._credential_pool = prefetched_primary_pool
+                else:
+                    from agent.credential_pool import load_pool
 
-                agent._credential_pool = load_pool(primary_provider)
+                    agent._credential_pool = load_pool(primary_provider)
             except Exception as exc:
                 logger.warning(
                     "Restore could not reload primary credential pool for %s: %s",
@@ -1639,6 +1719,7 @@ def restore_primary_runtime(agent) -> bool:
         # ── Reset fallback chain for the new turn ──
         agent._fallback_activated = False
         agent._fallback_index = 0
+        agent._rate_limit_backoff_count = 0  # reset exponential backoff counter
 
         # Reset the stale-call circuit breaker (#58962): the streak measured
         # the FALLBACK provider we're leaving; the restored primary deserves
@@ -2100,6 +2181,27 @@ def anthropic_prompt_cache_policy(
         and (eff_provider == "anthropic" or base_url_hostname(eff_base_url) == "api.anthropic.com")
     )
 
+    # MiniMax-M3 rides MiniMax's server-side automatic prefix cache on the
+    # Anthropic wire (content-keyed, no marker needed); explicit cache_control
+    # is documented for M2.7/M2.5/M2.1/M2 only, so markers on M3 are dead
+    # weight — never observable (cache_creation always 0) nor billable.
+    # Checked BEFORE the native-Anthropic return: provider="anthropic"
+    # pointed at a MiniMax /anthropic proxy is a supported override
+    # (_anthropic_base_url_override_ok) that would otherwise return
+    # (True, True) above this exclusion.
+    # Docs: https://platform.minimax.io/docs/api-reference/text-prompt-caching
+    is_minimax_provider = provider_lower in {"minimax", "minimax-cn"}
+    is_minimax_host = (
+        base_url_host_matches(eff_base_url, "api.minimax.io")
+        or base_url_host_matches(eff_base_url, "api.minimaxi.com")
+    )
+    is_minimax_route = is_minimax_provider or is_minimax_host
+    if is_anthropic_wire and is_minimax_route:
+        from agent.model_metadata import _model_name_suggests_minimax_m3
+
+        if _model_name_suggests_minimax_m3(eff_model):
+            return False, False
+
     if is_native_anthropic:
         return True, True
     # Envelope layout is an OpenAI-wire construct. Portal Claude on the native
@@ -2132,16 +2234,11 @@ def anthropic_prompt_cache_policy(
     # explicitly via provider id or host match so users on
     # provider=minimax / minimax-cn (or custom endpoints pointing at
     # api.minimax.io/anthropic / api.minimaxi.com/anthropic) get the
-    # same cost reduction as Claude traffic.
+    # same cost reduction as Claude traffic.  MiniMax-M3 never reaches
+    # here — it is excluded before the native-Anthropic return above.
     # Docs: https://platform.minimax.io/docs/api-reference/anthropic-api-compatible-cache
-    if is_anthropic_wire:
-        is_minimax_provider = provider_lower in {"minimax", "minimax-cn"}
-        is_minimax_host = (
-            base_url_host_matches(eff_base_url, "api.minimax.io")
-            or base_url_host_matches(eff_base_url, "api.minimaxi.com")
-        )
-        if is_minimax_provider or is_minimax_host:
-            return True, True
+    if is_anthropic_wire and is_minimax_route:
+        return True, True
 
     # Qwen/Alibaba on OpenCode (Zen/Go) and native DashScope: OpenAI-wire
     # transport that accepts Anthropic-style cache_control markers and
@@ -2905,6 +3002,26 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                     start_line=next_args.get("start_line"),
                     count=next_args.get("count"),
                     callback=getattr(agent, "read_terminal_callback", None),
+                ),
+                next_args,
+            )
+    elif function_name == "read_preview":
+        def _execute(next_args: dict) -> Any:
+            from tools.read_preview_tool import read_preview_tool as _read_preview_tool
+            return _finish_agent_tool(
+                _read_preview_tool(
+                    start=next_args.get("start"),
+                    count=next_args.get("count"),
+                    callback=getattr(agent, "read_preview_callback", None),
+                ),
+                next_args,
+            )
+    elif function_name == "read_window_below":
+        def _execute(next_args: dict) -> Any:
+            from tools.read_window_tool import read_window_below_tool as _read_window_below_tool
+            return _finish_agent_tool(
+                _read_window_below_tool(
+                    callback=getattr(agent, "read_window_below_callback", None),
                 ),
                 next_args,
             )
