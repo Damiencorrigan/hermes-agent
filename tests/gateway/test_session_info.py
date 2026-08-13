@@ -56,12 +56,12 @@ class TestFormatSessionInfo:
     def test_local_endpoint_shown(self, runner, tmp_path):
         p1, p2, p3 = _patch_info(
             tmp_path,
-            "model:\n  default: qwen3:8b\n  provider: custom\n  base_url: http://localhost:11434/v1\n  context_length: 8192\n",
+            "model:\n  default: qwen3:8b\n  provider: custom\n  base_url: http://192.168.0.214:11434/v1\n  context_length: 8192\n",
             "qwen3:8b",
-            {"provider": "custom", "base_url": "http://localhost:11434/v1", "api_key": ""})
+            {"provider": "custom", "base_url": "http://192.168.0.214:11434/v1", "api_key": ""})
         with p1, p2, p3:
             info = runner._format_session_info()
-        assert "localhost:11434" in info
+        assert "192.168.0.214:11434" in info
         assert "8K" in info
 
     def test_named_custom_provider_keeps_context_pin_without_model_base_url(

@@ -72,7 +72,7 @@ def test_setup_delegates_to_select_provider_and_model(tmp_path, monkeypatch):
     config = load_config()
 
     def fake_select():
-        _write_model_config(tmp_path, "custom", "http://localhost:11434/v1", "qwen3.5:32b")
+        _write_model_config(tmp_path, "custom", "http://192.168.0.214:11434/v1", "qwen3.5:32b")
 
     monkeypatch.setattr("hermes_cli.main.select_provider_and_model", fake_select)
 
@@ -82,7 +82,7 @@ def test_setup_delegates_to_select_provider_and_model(tmp_path, monkeypatch):
     reloaded = load_config()
     assert isinstance(reloaded["model"], dict)
     assert reloaded["model"]["provider"] == "custom"
-    assert reloaded["model"]["base_url"] == "http://localhost:11434/v1"
+    assert reloaded["model"]["base_url"] == "http://192.168.0.214:11434/v1"
     assert reloaded["model"]["default"] == "qwen3.5:32b"
 
 

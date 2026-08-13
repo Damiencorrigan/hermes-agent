@@ -317,7 +317,7 @@ model:
 模型目录从 `ollama.com/v1/models` 动态获取，缓存一小时。`model:tag` 格式（如 `qwen3-coder:480b-cloud`）在规范化过程中保留——不要使用连字符。
 
 :::tip Ollama Cloud 与本地 Ollama
-两者使用相同的 OpenAI 兼容 API。Cloud 是一等提供商（`--provider ollama-cloud`，`OLLAMA_API_KEY`）；本地 Ollama 通过自定义端点流程访问（基础 URL `http://localhost:11434/v1`，无需 key）。对于无法在本地运行的大模型使用 Cloud；对于隐私保护或离线工作使用本地。
+两者使用相同的 OpenAI 兼容 API。Cloud 是一等提供商（`--provider ollama-cloud`，`OLLAMA_API_KEY`）；本地 Ollama 通过自定义端点流程访问（基础 URL `http://192.168.0.214:11434/v1`，无需 key）。对于无法在本地运行的大模型使用 Cloud；对于隐私保护或离线工作使用本地。
 :::
 
 ### AWS Bedrock
@@ -593,7 +593,7 @@ ollama serve   # 在端口 11434 启动
 ```bash
 hermes model
 # 选择"Custom endpoint (self-hosted / VLLM / etc.)"
-# 输入 URL：http://localhost:11434/v1
+# 输入 URL：http://192.168.0.214:11434/v1
 # 跳过 API key（Ollama 不需要）
 # 输入模型名称（如 qwen2.5-coder:32b）
 ```
@@ -604,7 +604,7 @@ hermes model
 model:
   default: qwen2.5-coder:32b
   provider: custom
-  base_url: http://localhost:11434/v1
+  base_url: http://192.168.0.214:11434/v1
   context_length: 32768   # 见下方警告
 ```
 
@@ -834,7 +834,7 @@ Hermes 会自动以 64K 上下文长度加载 LM Studio 模型。
 
 3. 重新打开 WSL2 终端。`localhost` 现在可以访问 Windows 服务：
    ```bash
-   curl http://localhost:11434/v1/models   # Windows 上的 Ollama——正常工作
+   curl http://192.168.0.214:11434/v1/models   # Windows 上的 Ollama——正常工作
    ```
 
 :::note Hyper-V 防火墙
@@ -912,7 +912,7 @@ New-NetFirewallRule -DisplayName "Allow WSL2 to Model Server" -Direction Inbound
 
 ```bash
 # 将 URL 替换为你服务器的地址和端口
-curl http://localhost:11434/v1/models          # 镜像模式
+curl http://192.168.0.214:11434/v1/models          # 镜像模式
 curl http://172.29.192.1:11434/v1/models       # NAT 模式（使用你的实际主机 IP）
 ```
 
@@ -970,7 +970,7 @@ Hermes 从服务器的 `/v1/models` 端点自动检测上下文长度。如果�
 model:
   default: your-model
   provider: custom
-  base_url: http://localhost:11434/v1
+  base_url: http://192.168.0.214:11434/v1
   context_length: 32768
 ```
 
@@ -1109,7 +1109,7 @@ model:
 ```yaml
 custom_providers:
   - name: "My Local LLM"
-    base_url: "http://localhost:11434/v1"
+    base_url: "http://192.168.0.214:11434/v1"
     models:
       qwen3.5:27b:
         context_length: 32768

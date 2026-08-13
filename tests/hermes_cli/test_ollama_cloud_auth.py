@@ -319,7 +319,7 @@ class TestSwitchModelDirectAliasOverride:
         import hermes_cli.model_switch as ms
 
         test_aliases = {
-            "local": DirectAlias("local-model", "custom", "http://localhost:11434/v1"),
+            "local": DirectAlias("local-model", "custom", "http://192.168.0.214:11434/v1"),
         }
         monkeypatch.setattr(ms, "DIRECT_ALIASES", test_aliases)
         monkeypatch.setattr(ms, "resolve_alias",
@@ -336,7 +336,7 @@ class TestSwitchModelDirectAliasOverride:
         result = ms.switch_model("local", "openrouter", "old-model")
         assert result.success
         assert result.api_key == "no-key-required"
-        assert result.base_url == "http://localhost:11434/v1"
+        assert result.base_url == "http://192.168.0.214:11434/v1"
 
 
 # ---------------------------------------------------------------------------
@@ -361,7 +361,7 @@ class TestFallbackEdgeCases:
         fb = {
             "provider": "custom",
             "model": "local-model",
-            "base_url": "http://localhost:11434/v1",
+            "base_url": "http://192.168.0.214:11434/v1",
         }
 
         fb_base_url_hint = (fb.get("base_url") or "").strip() or None

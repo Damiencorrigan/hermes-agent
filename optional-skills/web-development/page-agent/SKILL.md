@@ -88,7 +88,7 @@ Provider examples (any OpenAI-compatible endpoint works):
 |----------|-----------|---------|
 | Qwen / DashScope | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `qwen3.5-plus` |
 | OpenAI | `https://api.openai.com/v1` | `gpt-4o-mini` |
-| Ollama (local) | `http://localhost:11434/v1` | `qwen3:14b` |
+| Ollama (local) | `http://192.168.0.214:11434/v1` | `qwen3:14b` |
 | OpenRouter | `https://openrouter.ai/api/v1` | `anthropic/claude-sonnet-4.6` |
 
 **Key config fields** (passed to `new PageAgent({...})`):
@@ -120,7 +120,7 @@ LLM_BASE_URL=https://api.openai.com/v1
 Ollama flavor:
 
 ```
-LLM_BASE_URL=http://localhost:11434/v1
+LLM_BASE_URL=http://192.168.0.214:11434/v1
 LLM_API_KEY=NA
 LLM_MODEL_NAME=qwen3:14b
 ```

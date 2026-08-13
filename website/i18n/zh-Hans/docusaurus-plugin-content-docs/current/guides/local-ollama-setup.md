@@ -49,7 +49,7 @@ curl -fsSL https://ollama.com/install.sh | sh
 
 ```bash
 ollama --version
-curl http://localhost:11434/api/tags   # 应返回 {"models":[]}
+curl http://192.168.0.214:11434/api/tags   # 应返回 {"models":[]}
 ```
 
 ## 第二步：拉取模型
@@ -80,7 +80,7 @@ ollama pull gemma4:31b
 验证模型是否正常工作：
 
 ```bash
-curl http://localhost:11434/v1/chat/completions \
+curl http://192.168.0.214:11434/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gemma4:31b",
@@ -101,7 +101,7 @@ hermes setup
 
 当提示选择提供商时，选择 **Custom Endpoint**，并输入：
 
-- **Base URL：** `http://localhost:11434/v1`
+- **Base URL：** `http://192.168.0.214:11434/v1`
 - **API Key：** 留空或输入 `no-key`（Ollama 不需要密钥）
 - **Model：** `gemma4:31b`（或你拉取的模型）
 
@@ -111,7 +111,7 @@ hermes setup
 model:
   default: "gemma4:31b"
   provider: "custom"
-  base_url: "http://localhost:11434/v1"
+  base_url: "http://192.168.0.214:11434/v1"
 ```
 
 ## 第四步：开始使用 Hermes
@@ -176,7 +176,7 @@ ollama create gemma4-16k -f /tmp/Modelfile
 
 ```bash
 # 将 keep-alive 设置为 24 小时
-curl http://localhost:11434/api/generate \
+curl http://192.168.0.214:11434/api/generate \
   -d '{"model": "gemma4:31b", "keep_alive": "24h"}'
 ```
 
@@ -211,7 +211,7 @@ ollama ps   # 显示已加载的模型及 GPU 层数
 model:
   default: "gemma4:31b"
   provider: "custom"
-  base_url: "http://localhost:11434/v1"
+  base_url: "http://192.168.0.214:11434/v1"
 
 platforms:
   telegram:
@@ -249,7 +249,7 @@ platforms:
 model:
   default: "gemma4:31b"
   provider: "custom"
-  base_url: "http://localhost:11434/v1"
+  base_url: "http://192.168.0.214:11434/v1"
 
 fallback_providers:
   - provider: openrouter

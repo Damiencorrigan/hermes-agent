@@ -519,7 +519,7 @@ def test_cmd_model_forwards_nous_login_tls_options(monkeypatch):
 
 def test_auto_provider_name_localhost():
     from hermes_cli.main import _auto_provider_name
-    assert _auto_provider_name("http://localhost:11434/v1") == "Local (localhost:11434)"
+    assert _auto_provider_name("http://192.168.0.214:11434/v1") == "Local (192.168.0.214:11434)"
     assert _auto_provider_name("http://127.0.0.1:1234/v1") == "Local (127.0.0.1:1234)"
 
 
@@ -543,7 +543,7 @@ def test_save_custom_provider_uses_provided_name(monkeypatch, tmp_path):
         saved.update(cfg)
     monkeypatch.setattr("hermes_cli.config.save_config", _save)
 
-    _save_custom_provider("http://localhost:11434/v1", name="Ollama")
+    _save_custom_provider("http://192.168.0.214:11434/v1", name="Ollama")
     entries = saved.get("custom_providers", [])
     assert len(entries) == 1
     assert entries[0]["name"] == "Ollama"
@@ -563,7 +563,7 @@ def test_save_custom_provider_references_the_key_instead_of_inlining_it(monkeypa
     monkeypatch.setattr("hermes_cli.config.save_config", lambda cfg: saved.update(cfg))
 
     _save_custom_provider(
-        "http://localhost:11434/v1",
+        "http://192.168.0.214:11434/v1",
         api_key="sk-secret",
         name="Ollama",
         key_env="HERMES_CUSTOM_LOCALHOST_11434_API_KEY",

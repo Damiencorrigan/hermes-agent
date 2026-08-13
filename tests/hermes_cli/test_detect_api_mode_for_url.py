@@ -57,4 +57,4 @@ class TestDefaultCase:
 
 
     def test_localhost_returns_none(self):
-        assert _detect_api_mode_for_url("http://localhost:11434/v1") is None
+        assert _detect_api_mode_for_url("http://192.168.0.214:11434/v1") is None

@@ -274,7 +274,7 @@ echo "Bearer token: $TOKEN"
 TOKEN=$(openssl rand -hex 16)
 nohup ssh -p 443 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
     -o ServerAliveInterval=30 \
-    -R0:localhost:11434 "k:$TOKEN+co+free@a.pinggy.io" \
+    -R0:192.168.0.214:11434 "k:$TOKEN+co+free@a.pinggy.io" \
     >/tmp/llm-pinggy.log 2>&1 &
 echo $! >/tmp/llm-pinggy.pid
 sleep 5

@@ -79,7 +79,7 @@ API 调用**仅发送至您配置的 LLM 提供商**（例如 OpenRouter、您�
 ```bash
 hermes model
 # 选择：Custom endpoint（手动输入 URL）
-# API base URL: http://localhost:11434/v1
+# API base URL: http://192.168.0.214:11434/v1
 # API key: ollama
 # Model name: qwen3.5:27b
 # Context length: 32768   ← 设置为与您服务器实际上下文窗口匹配的值
@@ -91,7 +91,7 @@ hermes model
 model:
   default: qwen3.5:27b
   provider: custom
-  base_url: http://localhost:11434/v1
+  base_url: http://192.168.0.214:11434/v1
 ```
 
 Hermes 会将端点、提供商和 base URL 持久化到 `config.yaml`，重启后仍然有效。如果您的本地服务器只加载了一个模型，`/model custom` 会自动检测到它。您也可以在 config.yaml 中设置 `provider: custom` — 这是一个一等提供商，不是其他任何东西的别名。
@@ -337,7 +337,7 @@ model:
 ```yaml
 custom_providers:
   - name: "My Server"
-    base_url: "http://localhost:11434/v1"
+    base_url: "http://192.168.0.214:11434/v1"
     models:
       qwen3.5:27b:
         context_length: 32768

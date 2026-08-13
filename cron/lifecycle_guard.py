@@ -255,10 +255,18 @@ def _resolve_script_directory(script_path: str) -> Optional[str]:
 
 def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     """Return ``(text, unsafe)`` using bounded, regular-file-only reads."""
+    # Reject malformed recursive paths before any filesystem API. Some macOS
+    # path coercions can raise ValueError outside the expected os.open branch.
+    if "\x00" in str(path):
+        return None, False
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
-    except OSError:
+    except (OSError, ValueError):
+        # ValueError can occur when recursive command parsing produces a
+        # malformed path containing an embedded NUL. A governance scanner
+        # must fail closed without crashing the caller; ignore that candidate
+        # and continue scanning the remaining command safely.
         return None, False
     try:
         metadata = os.fstat(descriptor)

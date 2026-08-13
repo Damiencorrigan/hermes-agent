@@ -462,7 +462,7 @@ def test_review_runtime_passes_auxiliary_curator_credentials(curator_env):
                 "provider": "custom",
                 "model": "local-mini",
                 "api_key": "sk-curator-only",
-                "base_url": "http://localhost:11434/v1",
+                "base_url": "http://192.168.0.214:11434/v1",
             },
         },
     }
@@ -470,7 +470,7 @@ def test_review_runtime_passes_auxiliary_curator_credentials(curator_env):
     assert binding.provider == "custom"
     assert binding.model == "local-mini"
     assert binding.explicit_api_key == "sk-curator-only"
-    assert binding.explicit_base_url == "http://localhost:11434/v1"
+    assert binding.explicit_base_url == "http://192.168.0.214:11434/v1"
 
 
 def test_review_runtime_strips_blank_aux_credentials(curator_env):

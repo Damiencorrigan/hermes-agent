@@ -84,7 +84,7 @@ def test_per_provider_max_output_tokens_fallback(isolated_home):
           provider: mylocal
         providers:
           mylocal:
-            api: http://localhost:11434/v1
+            api: http://192.168.0.214:11434/v1
             api_key: sk-test
             default_model: glm-5.1
             max_output_tokens: 12000

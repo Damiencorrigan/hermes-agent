@@ -227,7 +227,7 @@ describe('ModelSettings', () => {
           models: ['qwen3:latest'],
           authenticated: true,
           is_user_defined: true,
-          api_url: 'http://localhost:11434/v1'
+          api_url: 'http://192.168.0.214:11434/v1'
         }
       ]
     })
@@ -254,7 +254,7 @@ describe('ModelSettings', () => {
         model: 'qwen3:latest',
         provider: 'local-ollama',
         scope: 'main',
-        base_url: 'http://localhost:11434/v1'
+        base_url: 'http://192.168.0.214:11434/v1'
       })
     )
   })
@@ -325,7 +325,7 @@ describe('ModelSettings', () => {
           models: ['qwen3:latest'],
           authenticated: true,
           is_user_defined: true,
-          api_url: 'http://localhost:11434/v1'
+          api_url: 'http://192.168.0.214:11434/v1'
         }
       ]
     })
@@ -346,7 +346,7 @@ describe('ModelSettings', () => {
         provider: 'local-ollama',
         scope: 'auxiliary',
         task: 'vision',
-        base_url: 'http://localhost:11434/v1'
+        base_url: 'http://192.168.0.214:11434/v1'
       })
     )
   })

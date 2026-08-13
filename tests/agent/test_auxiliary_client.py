@@ -2227,7 +2227,7 @@ class TestStaleBaseUrlWarning:
         import agent.auxiliary_client as mod
         # Reset the module-level flag so the warning fires
         monkeypatch.setattr(mod, "_stale_base_url_warned", False)
-        monkeypatch.setenv("OPENAI_BASE_URL", "http://localhost:11434/v1")
+        monkeypatch.setenv("OPENAI_BASE_URL", "http://192.168.0.214:11434/v1")
         monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
 
         with patch("agent.auxiliary_client._read_main_provider", return_value="openrouter"), \
@@ -2394,13 +2394,13 @@ class TestAuxiliaryTaskExtraBody:
         """No warning when the provider is 'custom' — OPENAI_BASE_URL is expected."""
         import agent.auxiliary_client as mod
         monkeypatch.setattr(mod, "_stale_base_url_warned", False)
-        monkeypatch.setenv("OPENAI_BASE_URL", "http://localhost:11434/v1")
+        monkeypatch.setenv("OPENAI_BASE_URL", "http://192.168.0.214:11434/v1")
         monkeypatch.setenv("OPENAI_API_KEY", "test-key")
 
         with patch("agent.auxiliary_client._read_main_provider", return_value="custom"), \
              patch("agent.auxiliary_client._read_main_model", return_value="llama3"), \
              patch("agent.auxiliary_client._resolve_custom_runtime",
-                   return_value=("http://localhost:11434/v1", "test-key", None)), \
+                   return_value=("http://192.168.0.214:11434/v1", "test-key", None)), \
              patch("agent.auxiliary_client.OpenAI") as mock_openai, \
              caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"):
             mock_openai.return_value = MagicMock()

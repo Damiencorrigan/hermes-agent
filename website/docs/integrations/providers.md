@@ -346,7 +346,7 @@ model:
 The model catalog is fetched dynamically from `ollama.com/v1/models` and cached for one hour. `model:tag` notation (e.g. `qwen3-coder:480b-cloud`) is preserved through normalization — don't use dashes.
 
 :::tip Ollama Cloud vs local Ollama
-Both speak the same OpenAI-compatible API. Cloud is a first-class provider (`--provider ollama-cloud`, `OLLAMA_API_KEY`); local Ollama is reached via the Custom Endpoint flow (base URL `http://localhost:11434/v1`, no key). Use cloud for large models you can't run locally; use local for privacy or offline work.
+Both speak the same OpenAI-compatible API. Cloud is a first-class provider (`--provider ollama-cloud`, `OLLAMA_API_KEY`); local Ollama is reached via the Custom Endpoint flow (base URL `http://192.168.0.214:11434/v1`, no key). Use cloud for large models you can't run locally; use local for privacy or offline work.
 :::
 
 ### AWS Bedrock
@@ -647,7 +647,7 @@ Then configure Hermes:
 ```bash
 hermes model
 # Select "Custom endpoint (self-hosted / VLLM / etc.)"
-# Enter URL: http://localhost:11434/v1
+# Enter URL: http://192.168.0.214:11434/v1
 # Skip API key (Ollama doesn't need one)
 # Enter model name (e.g. qwen2.5-coder:32b)
 ```
@@ -658,7 +658,7 @@ Or configure `config.yaml` directly:
 model:
   default: qwen2.5-coder:32b
   provider: custom
-  base_url: http://localhost:11434/v1
+  base_url: http://192.168.0.214:11434/v1
   context_length: 64000   # See warning below
 ```
 
@@ -902,7 +902,7 @@ Available on **Windows 11 22H2+**, mirrored mode makes `localhost` work bidirect
 
 3. Reopen your WSL2 terminal. `localhost` now reaches Windows services:
    ```bash
-   curl http://localhost:11434/v1/models   # Ollama on Windows — works
+   curl http://192.168.0.214:11434/v1/models   # Ollama on Windows — works
    ```
 
 :::note Hyper-V Firewall
@@ -980,7 +980,7 @@ From inside WSL2, test that you can reach your model server:
 
 ```bash
 # Replace URL with your server's address and port
-curl http://localhost:11434/v1/models          # Mirrored mode
+curl http://192.168.0.214:11434/v1/models          # Mirrored mode
 curl http://172.29.192.1:11434/v1/models       # NAT mode (use your actual host IP)
 ```
 
@@ -1038,7 +1038,7 @@ Hermes auto-detects context length from your server's `/v1/models` endpoint. If 
 model:
   default: your-model
   provider: custom
-  base_url: http://localhost:11434/v1
+  base_url: http://192.168.0.214:11434/v1
   context_length: 64000
 ```
 
@@ -1177,7 +1177,7 @@ For custom endpoints, you can also set context length per model:
 ```yaml
 providers:
   my-local-llm:
-    api: "http://localhost:11434/v1"
+    api: "http://192.168.0.214:11434/v1"
     models:
       qwen3.5:27b:
         context_length: 64000

@@ -90,7 +90,7 @@ def test_default_model_only_declaration_routes():
     user_providers = {
         "local-ollama": {
             "name": "Local Ollama",
-            "base_url": "http://localhost:11434/v1",
+            "base_url": "http://192.168.0.214:11434/v1",
             "default_model": "qwen3.5-4b",
         }
     }

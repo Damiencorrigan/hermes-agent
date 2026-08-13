@@ -3838,7 +3838,7 @@ class TestRunConversation:
     def test_ollama_glm_stop_after_tools_without_terminal_boundary_requests_continuation(self, agent):
         """Ollama-hosted GLM responses can misreport truncated output as stop."""
         self._setup_agent(agent)
-        agent.base_url = "http://localhost:11434/v1"
+        agent.base_url = "http://192.168.0.214:11434/v1"
         agent._base_url_lower = agent.base_url.lower()
         agent.model = "glm-5.1:cloud"
 

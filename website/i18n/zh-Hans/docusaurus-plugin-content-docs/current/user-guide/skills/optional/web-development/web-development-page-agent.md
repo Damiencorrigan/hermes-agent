@@ -105,7 +105,7 @@ Provider 示例（任何兼容 OpenAI 的端点均可使用）：
 |----------|-----------|---------|
 | Qwen / DashScope | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `qwen3.5-plus` |
 | OpenAI | `https://api.openai.com/v1` | `gpt-4o-mini` |
-| Ollama（本地） | `http://localhost:11434/v1` | `qwen3:14b` |
+| Ollama（本地） | `http://192.168.0.214:11434/v1` | `qwen3:14b` |
 | OpenRouter | `https://openrouter.ai/api/v1` | `anthropic/claude-sonnet-4.6` |
 
 **关键配置字段**（传入 `new PageAgent({...})`）：
@@ -137,7 +137,7 @@ LLM_BASE_URL=https://api.openai.com/v1
 Ollama 配置：
 
 ```
-LLM_BASE_URL=http://localhost:11434/v1
+LLM_BASE_URL=http://192.168.0.214:11434/v1
 LLM_API_KEY=NA
 LLM_MODEL_NAME=qwen3:14b
 ```

@@ -1438,7 +1438,7 @@ def test_auto_provider_with_local_base_url_bypasses_anthropic_key(monkeypatch):
         lambda: {
             "default": "ollama/minimax-m2.7:cloud",
             "provider": "auto",
-            "base_url": "http://localhost:11434",
+            "base_url": "http://192.168.0.214:11434",
         },
     )
 
@@ -1448,7 +1448,7 @@ def test_auto_provider_with_local_base_url_bypasses_anthropic_key(monkeypatch):
     assert "anthropic.com" not in resolved.get("base_url", ""), (
         f"Expected custom endpoint, got Anthropic: {resolved}"
     )
-    assert resolved["base_url"] == "http://localhost:11434"
+    assert resolved["base_url"] == "http://192.168.0.214:11434"
     # provider should be custom/openrouter (OpenAI-compat), not anthropic
     assert resolved["provider"] != "anthropic", (
         f"Should have routed to custom endpoint, not anthropic: {resolved}"

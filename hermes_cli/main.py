@@ -3876,7 +3876,7 @@ def _aux_flow_custom_endpoint(task: str, task_cfg: dict) -> None:
 
     print()
     print(f"  Custom endpoint for {display_name}")
-    print("  Provide an OpenAI-compatible base URL (e.g. http://localhost:11434/v1)")
+    print("  Provide an OpenAI-compatible base URL (e.g. http://192.168.0.214:11434/v1)")
     print()
     try:
         url_prompt = (
@@ -4046,7 +4046,7 @@ def _prompt_custom_api_mode_selection(base_url: str, current_api_mode: str = "")
 def _auto_provider_name(base_url: str) -> str:
     """Generate a display name from a custom endpoint URL.
 
-    Returns a human-friendly label like "Local (localhost:11434)" or
+    Returns a human-friendly label like "Local (192.168.0.214:11434)" or
     "RunPod (xyz.runpod.io)".  Used as the default when prompting the
     user for a display name during custom endpoint setup.
     """

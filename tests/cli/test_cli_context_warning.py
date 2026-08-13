@@ -96,7 +96,7 @@ class TestLowContextWarning:
     def test_ollama_specific_hint(self, cli_obj):
         """Ollama-specific fix shown when port 11434 detected."""
         cli_obj.agent.context_compressor.context_length = 4096
-        cli_obj.base_url = "http://localhost:11434/v1"
+        cli_obj.base_url = "http://192.168.0.214:11434/v1"
         with patch("cli.get_tool_definitions", return_value=[]), \
              patch("cli.build_welcome_banner"):
             cli_obj.show_banner()

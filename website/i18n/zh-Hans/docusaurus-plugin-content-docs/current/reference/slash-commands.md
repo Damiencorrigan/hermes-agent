@@ -169,7 +169,7 @@ model_aliases:
   ollama-qwen:
     model: qwen3-coder:30b
     provider: custom
-    base_url: http://localhost:11434/v1
+    base_url: http://192.168.0.214:11434/v1
 ```
 
 **简短格式** — 用一个字符串表示 `provider/model`。无需编辑 YAML，直接从 shell 设置：

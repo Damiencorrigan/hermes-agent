@@ -170,7 +170,7 @@ class TestLocalhostIPv4SiblingSites:
         not be corrupted — only the URL's own host is rewritten."""
         from agent.model_metadata import _localhost_to_ipv4
 
-        proxied = "https://proxy.example.com/route?upstream=http://localhost:11434"
+        proxied = "https://proxy.example.com/route?upstream=http://192.168.0.214:11434"
         assert _localhost_to_ipv4(proxied) == proxied
         # Host must be a full label: localhost.example.com is NOT localhost.
         assert _localhost_to_ipv4("http://localhost.example.com/v1") == (
@@ -182,7 +182,7 @@ class TestLocalhostIPv4SiblingSites:
 
         client = _client_mock(_mock_show_response(131072))
         with patch("httpx.Client", return_value=client):
-            _query_ollama_api_show("llama3", "http://localhost:11434")
+            _query_ollama_api_show("llama3", "http://192.168.0.214:11434")
 
         assert client.post.call_args[0][0].startswith("http://127.0.0.1:11434")
 

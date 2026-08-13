@@ -721,7 +721,7 @@ class TestAdversarialEdgeCases:
 
 
     def test_connection_refused_error(self):
-        e = ConnectionRefusedError("Connection refused: localhost:11434")
+        e = ConnectionRefusedError("Connection refused: 192.168.0.214:11434")
         result = classify_api_error(e, provider="ollama")
         assert result.reason == FailoverReason.timeout
 

@@ -17,7 +17,7 @@ class TestLocalStreamReadTimeout:
     """Verify stream read timeout auto-detection logic."""
 
     @pytest.mark.parametrize("base_url", [
-        "http://localhost:11434",
+        "http://192.168.0.214:11434",
         "http://127.0.0.1:8080",
         "http://0.0.0.0:5000",
         "http://192.168.1.100:8000",
@@ -41,7 +41,7 @@ class TestLocalStreamReadTimeout:
         with patch.dict(os.environ, {"HERMES_STREAM_READ_TIMEOUT": "300"}, clear=False):
             _base_timeout = float(os.getenv("HERMES_API_TIMEOUT", 1800.0))
             _stream_read_timeout = float(os.getenv("HERMES_STREAM_READ_TIMEOUT", 120.0))
-            base_url = "http://localhost:11434"
+            base_url = "http://192.168.0.214:11434"
             if _stream_read_timeout == 120.0 and base_url and is_local_endpoint(base_url):
                 _stream_read_timeout = _base_timeout
             assert _stream_read_timeout == 300.0
@@ -63,7 +63,7 @@ class TestIsLocalEndpoint:
     """Direct unit tests for is_local_endpoint."""
 
     @pytest.mark.parametrize("url", [
-        "http://localhost:11434",
+        "http://192.168.0.214:11434",
         "http://127.0.0.1:8080",
         "http://0.0.0.0:5000",
         "http://[::1]:11434",

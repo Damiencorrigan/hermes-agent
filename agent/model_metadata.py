@@ -924,7 +924,7 @@ def _localhost_to_ipv4(url: str) -> str:
 
     Only the URL's own host component is rewritten (anchored at the scheme),
     so a non-localhost URL whose path or query merely embeds the substring
-    ``http://localhost...`` (e.g. ``?upstream=http://localhost:11434``)
+    ``http://localhost...`` (e.g. ``?upstream=http://192.168.0.214:11434``)
     passes through untouched.
     """
     if not url or not isinstance(url, str):

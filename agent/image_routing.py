@@ -440,7 +440,7 @@ def _lookup_supports_vision(
 
     base_url = _resolve_inference_base_url(cfg, provider)
     if not base_url and (provider or "").strip().lower() == "ollama":
-        base_url = "http://localhost:11434/v1"
+        base_url = "http://192.168.0.214:11434/v1"
     if _should_probe_ollama_vision(provider, base_url):
         try:
             from agent.model_metadata import query_ollama_supports_vision

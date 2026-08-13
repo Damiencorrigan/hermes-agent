@@ -188,7 +188,7 @@ model_aliases:
   ollama-qwen:
     model: qwen3-coder:30b
     provider: custom
-    base_url: http://localhost:11434/v1
+    base_url: http://192.168.0.214:11434/v1
 ```
 
 **Short form** — `provider/model` in one string. Set from the shell without editing YAML:

@@ -177,7 +177,7 @@ pg_isready -h localhost -p 5432
 
 ```bash
 # Check Ollama is running:
-curl http://localhost:11434/api/tags
+curl http://192.168.0.214:11434/api/tags
 ```
 
 ### Memories not appearing

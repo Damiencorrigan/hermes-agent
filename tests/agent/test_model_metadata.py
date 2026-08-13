@@ -817,7 +817,7 @@ class TestGetModelContextLength:
         window for compression (#63122)."""
         result = get_model_context_length(
             "my-model",
-            base_url="http://localhost:11434",
+            base_url="http://192.168.0.214:11434",
         )
         assert result == 32768, (
             f"Expected configured Modelfile num_ctx (32768), got {result}. "
@@ -908,7 +908,7 @@ class TestStripProviderPrefix:
             mock_ep.return_value = {"qwen3.5:27b": {"context_length": 32768}}
             result = get_model_context_length(
                 "qwen3.5:27b",
-                base_url="http://localhost:11434/v1",
+                base_url="http://192.168.0.214:11434/v1",
             )
         assert result == 32768
 

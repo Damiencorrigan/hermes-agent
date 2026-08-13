@@ -395,7 +395,7 @@ from openai import OpenAI
 # Point to local Ollama server
 client = instructor.from_openai(
     OpenAI(
-        base_url="http://localhost:11434/v1",
+        base_url="http://192.168.0.214:11434/v1",
         api_key="ollama"  # Required but ignored
     ),
     mode=instructor.Mode.JSON

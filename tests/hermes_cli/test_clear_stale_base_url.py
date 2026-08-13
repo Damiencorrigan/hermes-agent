@@ -26,7 +26,7 @@ class TestClearStaleOpenaiBaseUrl:
         from hermes_cli.main import _clear_stale_openai_base_url
 
         _write_provider("openrouter")
-        save_env_value("OPENAI_BASE_URL", "http://localhost:11434/v1")
+        save_env_value("OPENAI_BASE_URL", "http://192.168.0.214:11434/v1")
 
         _clear_stale_openai_base_url()
 
@@ -38,12 +38,12 @@ class TestClearStaleOpenaiBaseUrl:
         from hermes_cli.main import _clear_stale_openai_base_url
 
         _write_provider("custom")
-        save_env_value("OPENAI_BASE_URL", "http://localhost:11434/v1")
+        save_env_value("OPENAI_BASE_URL", "http://192.168.0.214:11434/v1")
 
         _clear_stale_openai_base_url()
 
         result = get_env_value("OPENAI_BASE_URL")
-        assert result == "http://localhost:11434/v1", \
+        assert result == "http://192.168.0.214:11434/v1", \
             f"Expected OPENAI_BASE_URL to be preserved, got: {result!r}"
 
 

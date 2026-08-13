@@ -37,8 +37,8 @@ def _validate(model, provider="openrouter", api_models=FAKE_API_MODELS, **kw):
     """Shortcut: call validate_requested_model with mocked API."""
     probe_payload = {
         "models": api_models,
-        "probed_url": "http://localhost:11434/v1/models",
-        "resolved_base_url": kw.get("base_url", "") or "http://localhost:11434/v1",
+        "probed_url": "http://192.168.0.214:11434/v1/models",
+        "resolved_base_url": kw.get("base_url", "") or "http://192.168.0.214:11434/v1",
         "suggested_base_url": None,
         "used_fallback": False,
     }

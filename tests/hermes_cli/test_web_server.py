@@ -2394,7 +2394,7 @@ class TestDenormalizeProviderSwitch:
             "model": {
                 "default": "llama3.2",
                 "provider": "ollama-local",
-                "base_url": "http://localhost:11434/v1",
+                "base_url": "http://192.168.0.214:11434/v1",
                 "api_mode": "chat_completions",
             }
         })

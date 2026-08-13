@@ -49,7 +49,7 @@ Verify it's running:
 
 ```bash
 ollama --version
-curl http://localhost:11434/api/tags   # Should return {"models":[]}
+curl http://192.168.0.214:11434/api/tags   # Should return {"models":[]}
 ```
 
 ## Step 2: Pull a Model
@@ -80,7 +80,7 @@ You can pull several models and switch between them inside Hermes with `/model`.
 Verify the model works:
 
 ```bash
-curl http://localhost:11434/v1/chat/completions \
+curl http://192.168.0.214:11434/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gemma4:31b",
@@ -101,7 +101,7 @@ hermes setup
 
 When prompted for a provider, select **Custom Endpoint** and enter:
 
-- **Base URL:** `http://localhost:11434/v1`
+- **Base URL:** `http://192.168.0.214:11434/v1`
 - **API Key:** Leave empty or type `no-key` (Ollama doesn't need one)
 - **Model:** `gemma4:31b` (or whichever model you pulled)
 
@@ -111,7 +111,7 @@ Alternatively, edit `~/.hermes/config.yaml` directly:
 model:
   default: "gemma4:31b"
   provider: "custom"
-  base_url: "http://localhost:11434/v1"
+  base_url: "http://192.168.0.214:11434/v1"
 ```
 
 ## Step 4: Start Using Hermes
@@ -176,7 +176,7 @@ By default, Ollama unloads models after 5 minutes of inactivity. For a persisten
 
 ```bash
 # Set keep-alive to 24 hours
-curl http://localhost:11434/api/generate \
+curl http://192.168.0.214:11434/api/generate \
   -d '{"model": "gemma4:31b", "keep_alive": "24h"}'
 ```
 
@@ -211,7 +211,7 @@ Once Hermes works locally in the CLI, you can expose it as a Telegram or Discord
 model:
   default: "gemma4:31b"
   provider: "custom"
-  base_url: "http://localhost:11434/v1"
+  base_url: "http://192.168.0.214:11434/v1"
 
 platforms:
   telegram:
@@ -249,7 +249,7 @@ Local models can struggle with complex tasks. Set up a cloud fallback that only 
 model:
   default: "gemma4:31b"
   provider: "custom"
-  base_url: "http://localhost:11434/v1"
+  base_url: "http://192.168.0.214:11434/v1"
 
 fallback_providers:
   - provider: openrouter

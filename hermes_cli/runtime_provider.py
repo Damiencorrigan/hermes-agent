@@ -1809,7 +1809,7 @@ def resolve_runtime_provider(
         return custom_runtime
 
     # If provider is "auto" (or unset) but config.yaml has an explicit base_url
-    # pointing at a custom/local endpoint (e.g. Ollama at localhost:11434),
+    # pointing at a custom/local endpoint (e.g. Ollama at 192.168.0.214:11434),
     # route through the OpenAI-compatible resolver instead of letting
     # resolve_provider() pick up an ANTHROPIC_API_KEY or OPENAI_API_KEY from
     # the environment and send the request to a cloud API. Fixes #3846.

@@ -90,9 +90,9 @@ class TestLocalUnaffected:
 
     def test_local_still_raised_to_base(self):
         """Local providers keep their existing behavior (raise to base timeout)."""
-        stale = _resolve_stale_timeout("http://localhost:11434", est_tokens=0)
+        stale = _resolve_stale_timeout("http://192.168.0.214:11434", est_tokens=0)
         assert stale == float("inf")  # detector disabled for local
-        read = _resolve_read_timeout("http://localhost:11434", stale)
+        read = _resolve_read_timeout("http://192.168.0.214:11434", stale)
         assert read == 1800.0  # not clamped by inf
 
     def test_stale_none_falls_back_to_default(self):

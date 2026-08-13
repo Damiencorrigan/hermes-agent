@@ -145,7 +145,7 @@ class TestLookupSupportsVisionOverride:
 
 
     def test_ollama_probe_when_models_dev_missing(self):
-        cfg = {"model": {"base_url": "http://localhost:11434/v1"}}
+        cfg = {"model": {"base_url": "http://192.168.0.214:11434/v1"}}
         with patch("agent.models_dev.get_model_capabilities", return_value=None), \
              patch("agent.image_routing._should_probe_ollama_vision", return_value=True), \
              patch("agent.model_metadata.query_ollama_supports_vision", return_value=True):

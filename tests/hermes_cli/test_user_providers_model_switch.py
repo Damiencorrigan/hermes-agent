@@ -37,7 +37,7 @@ def test_list_authenticated_providers_includes_full_models_list_from_user_provid
     user_providers = {
         "local-ollama": {
             "name": "Local Ollama",
-            "api": "http://localhost:11434/v1",
+            "api": "http://192.168.0.214:11434/v1",
             "default_model": "minimax-m2.7:cloud",
             "models": [
                 "minimax-m2.7:cloud",
@@ -83,7 +83,7 @@ def test_list_authenticated_providers_enumerates_dict_format_models(monkeypatch)
     user_providers = {
         "local-ollama": {
             "name": "Local Ollama",
-            "api": "http://localhost:11434/v1",
+            "api": "http://192.168.0.214:11434/v1",
             "default_model": "minimax-m2.7:cloud",
             "models": {
                 "minimax-m2.7:cloud": {"context_length": 196608},
@@ -359,7 +359,7 @@ def test_switch_model_resolves_user_provider_credentials(monkeypatch, tmp_path):
     config = {
         "providers": {
             "local-ollama": {
-                "api": "http://localhost:11434/v1",
+                "api": "http://192.168.0.214:11434/v1",
                 "name": "Local Ollama",
                 "default_model": "minimax-m2.7:cloud",
             }
@@ -380,7 +380,7 @@ def test_switch_model_resolves_user_provider_credentials(monkeypatch, tmp_path):
         raw_input="kimi-k2.5:cloud",
         current_provider="local-ollama",
         current_model="minimax-m2.7:cloud",
-        current_base_url="http://localhost:11434/v1",
+        current_base_url="http://192.168.0.214:11434/v1",
         is_global=False,
         user_providers=config["providers"],
     )
@@ -528,7 +528,7 @@ def test_section3_probes_no_key_endpoint_with_singular_default_model(monkeypatch
     user_providers = {
         "local-ollama": {
             "name": "Local Ollama",
-            "api": "http://localhost:11434/v1",
+            "api": "http://192.168.0.214:11434/v1",
             "default_model": "llama3",
             # No api_key, no models: list — singular default only.
         }

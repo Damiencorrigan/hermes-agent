@@ -59,7 +59,7 @@ class TestQueryLocalContextLengthOllama:
 
         with patch("agent.model_metadata.detect_local_server_type", return_value="ollama"), \
              patch("httpx.Client", return_value=client_mock):
-            result = _query_local_context_length("some-model", "http://localhost:11434/v1")
+            result = _query_local_context_length("some-model", "http://192.168.0.214:11434/v1")
 
         assert result == 32768
 
@@ -79,7 +79,7 @@ class TestQueryLocalContextLengthOllama:
 
         with patch("agent.model_metadata.detect_local_server_type", return_value="ollama"), \
              patch("httpx.Client", return_value=client_mock):
-            result = _query_local_context_length("some-model", "http://localhost:11434/v1")
+            result = _query_local_context_length("some-model", "http://192.168.0.214:11434/v1")
 
         assert result == 65536
 
@@ -525,7 +525,7 @@ class TestQueryLocalContextLengthNetworkError:
 
         with patch("agent.model_metadata.detect_local_server_type", return_value=None), \
              patch("httpx.Client", return_value=client_mock):
-            result = _query_local_context_length("omnicoder-9b", "http://localhost:11434/v1")
+            result = _query_local_context_length("omnicoder-9b", "http://192.168.0.214:11434/v1")
 
         assert result is None
 
@@ -572,7 +572,7 @@ class TestGetModelContextLengthLocalFallback:
              patch("agent.model_metadata.fetch_model_metadata", return_value={}), \
              patch("agent.model_metadata.is_local_endpoint", return_value=True), \
              patch("agent.model_metadata._query_local_context_length", return_value=None):
-            result = get_model_context_length("omnicoder-9b", "http://localhost:11434/v1")
+            result = get_model_context_length("omnicoder-9b", "http://192.168.0.214:11434/v1")
 
         assert result == CONTEXT_PROBE_TIERS[0]
 
@@ -618,8 +618,8 @@ class TestLocalContextProbeTTLCache:
 
         with patch("agent.model_metadata.detect_local_server_type", return_value="ollama") as detect, \
              patch("httpx.Client", return_value=client_mock):
-            first = _query_local_context_length("m", "http://localhost:11434/v1")
-            second = _query_local_context_length("m", "http://localhost:11434/v1")
+            first = _query_local_context_length("m", "http://192.168.0.214:11434/v1")
+            second = _query_local_context_length("m", "http://192.168.0.214:11434/v1")
 
         assert first == 32768
         assert second == 32768
@@ -639,8 +639,8 @@ class TestLocalContextProbeTTLCache:
 
         with patch("agent.model_metadata.detect_local_server_type", return_value="ollama") as detect, \
              patch("httpx.Client", return_value=client_mock):
-            _query_local_context_length("m1", "http://localhost:11434/v1")
-            _query_local_context_length("m2", "http://localhost:11434/v1")
+            _query_local_context_length("m1", "http://192.168.0.214:11434/v1")
+            _query_local_context_length("m2", "http://192.168.0.214:11434/v1")
 
         assert detect.call_count == 2
 
@@ -660,9 +660,9 @@ class TestLocalContextProbeTTLCache:
 
         with patch("agent.model_metadata.detect_local_server_type", return_value=None) as detect, \
              patch("httpx.Client", return_value=client_mock):
-            first = _query_local_context_length("m", "http://localhost:11434/v1")
+            first = _query_local_context_length("m", "http://192.168.0.214:11434/v1")
             # Retry within TTL must re-probe (None was not cached).
-            second = _query_local_context_length("m", "http://localhost:11434/v1")
+            second = _query_local_context_length("m", "http://192.168.0.214:11434/v1")
 
         assert first is None
         assert second is None

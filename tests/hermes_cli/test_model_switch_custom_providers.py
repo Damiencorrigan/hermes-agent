@@ -318,10 +318,10 @@ def test_list_authenticated_providers_bare_custom_slug_recovers(monkeypatch):
 
     providers = list_authenticated_providers(
         current_provider="custom",
-        current_base_url="http://localhost:11434/v1",
+        current_base_url="http://192.168.0.214:11434/v1",
         user_providers={},
         custom_providers=[
-            {"name": "Ollama — GLM 5.1", "base_url": "http://localhost:11434/v1",
+            {"name": "Ollama — GLM 5.1", "base_url": "http://192.168.0.214:11434/v1",
              "api_key": "ollama", "model": "glm-5.1"},
         ],
         max_models=50,
@@ -395,11 +395,11 @@ def test_list_authenticated_providers_distinct_endpoints_stay_separate(monkeypat
     providers = list_authenticated_providers(
         user_providers={},
         custom_providers=[
-            {"name": "Ollama — GLM 5.1", "base_url": "http://localhost:11434/v1",
+            {"name": "Ollama — GLM 5.1", "base_url": "http://192.168.0.214:11434/v1",
              "api_key": "ollama", "model": "glm-5.1"},
             {"name": "Moonshot", "base_url": "https://api.moonshot.cn/v1",
              "api_key": "sk-m", "model": "moonshot-v1"},
-            {"name": "Ollama — Qwen3-coder", "base_url": "http://localhost:11434/v1",
+            {"name": "Ollama — Qwen3-coder", "base_url": "http://192.168.0.214:11434/v1",
              "api_key": "ollama", "model": "qwen3-coder"},
         ],
         max_models=50,
@@ -489,7 +489,7 @@ def test_list_authenticated_providers_total_models_reflects_grouped_count(monkey
     monkeypatch.setattr(providers_mod, "HERMES_OVERLAYS", {})
 
     entries = [
-        {"name": f"Ollama \u2014 Model {i}", "base_url": "http://localhost:11434/v1",
+        {"name": f"Ollama \u2014 Model {i}", "base_url": "http://192.168.0.214:11434/v1",
          "api_key": "ollama", "model": f"model-{i}"}
         for i in range(6)
     ]
@@ -920,7 +920,7 @@ def test_custom_provider_context_length_models_dict_still_probes(monkeypatch):
         custom_providers=[
             {
                 "name": "Local Ollama",
-                "base_url": "http://localhost:11434/v1",
+                "base_url": "http://192.168.0.214:11434/v1",
                 "model": "qwen3.6:35b-mlx",
                 "models": {"qwen3.6:35b-mlx": {"context_length": 32768}},
             }
@@ -928,12 +928,12 @@ def test_custom_provider_context_length_models_dict_still_probes(monkeypatch):
         # GUI picker path: probe current custom provider only.
         probe_custom_providers=False,
         probe_current_custom_provider=True,
-        current_base_url="http://localhost:11434/v1",
+        current_base_url="http://192.168.0.214:11434/v1",
     )
 
     assert len(calls) == 1
     assert calls[0][0] == ""
-    assert calls[0][1] == "http://localhost:11434/v1"
+    assert calls[0][1] == "http://192.168.0.214:11434/v1"
     row = next(p for p in providers if p["name"] == "Local Ollama")
     assert row["models"] == ["qwen3.6:35b-mlx", "gemma4:31b", "llama3"]
     assert row["total_models"] == 3
@@ -957,7 +957,7 @@ def test_custom_provider_dict_models_pin_requires_discover_false(monkeypatch):
         custom_providers=[
             {
                 "name": "Local Ollama",
-                "base_url": "http://localhost:11434/v1",
+                "base_url": "http://192.168.0.214:11434/v1",
                 "model": "llama3",
                 "models": {"llama3": {}},
                 "discover_models": False,

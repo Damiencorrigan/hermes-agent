@@ -113,7 +113,7 @@ def test_credentials_ready_true_for_keyless_local_endpoint(monkeypatch):
         lambda **kw: {
             "provider": "custom",
             "api_key": "",
-            "base_url": "http://localhost:11434/v1",
+            "base_url": "http://192.168.0.214:11434/v1",
             "source": "custom_provider",
         },
     )

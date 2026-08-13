@@ -60,7 +60,7 @@ Yes. Run `hermes model`, select **Custom endpoint**, and enter your server's URL
 ```bash
 hermes model
 # Select: Custom endpoint (enter URL manually)
-# API base URL: http://localhost:11434/v1
+# API base URL: http://192.168.0.214:11434/v1
 # API key: ollama
 # Model name: qwen3.5:27b
 # Context length: 64000   ← Hermes minimum; set this to match your server's actual context window
@@ -72,7 +72,7 @@ Or configure it directly in `config.yaml`:
 model:
   default: qwen3.5:27b
   provider: custom
-  base_url: http://localhost:11434/v1
+  base_url: http://192.168.0.214:11434/v1
 ```
 
 Hermes persists the endpoint, provider, and base URL in `config.yaml` so it survives restarts. If your local server has exactly one model loaded, `/model custom` auto-detects it. You can also set `provider: custom` in config.yaml — it's a first-class provider, not an alias for anything else.
@@ -318,7 +318,7 @@ Or for custom endpoints, add it per-model on the provider entry:
 ```yaml
 providers:
   my-server:
-    api: "http://localhost:11434/v1"
+    api: "http://192.168.0.214:11434/v1"
     models:
       qwen3.5:27b:
         context_length: 64000

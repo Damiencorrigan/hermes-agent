@@ -316,7 +316,7 @@ dspy.settings.configure(lm=lm)
 ```python
 lm = dspy.OllamaLocal(
     model="llama3.1",
-    base_url="http://localhost:11434"
+    base_url="http://192.168.0.214:11434"
 )
 dspy.settings.configure(lm=lm)
 ```

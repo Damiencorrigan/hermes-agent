@@ -2822,7 +2822,7 @@ def list_authenticated_providers(
     # Each ``custom_providers`` entry represents one model under a named
     # provider. Entries sharing the same endpoint, credential identity, and
     # wire protocol are grouped into a single picker row, so e.g. four Ollama
-    # entries pointing at ``http://localhost:11434/v1`` with per-model display
+    # entries pointing at ``http://192.168.0.214:11434/v1`` with per-model display
     # names ("Ollama — GLM 5.1", "Ollama — Qwen3-coder", ...) appear as one
     # "Ollama" row with four models inside instead of four near-duplicates
     # that differ only by suffix. Same-host entries with different ``key_env``

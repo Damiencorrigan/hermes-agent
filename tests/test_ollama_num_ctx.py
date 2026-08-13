@@ -43,7 +43,7 @@ class TestQueryOllamaNumCtx:
             # httpx is imported inside the function — patch the module import
             import httpx
             with patch.object(httpx, "Client", return_value=mock_ctx):
-                result = query_ollama_num_ctx("llama3.1:8b", "http://localhost:11434/v1")
+                result = query_ollama_num_ctx("llama3.1:8b", "http://192.168.0.214:11434/v1")
 
         assert result == 131072
 
@@ -58,7 +58,7 @@ class TestQueryOllamaNumCtx:
         with patch("agent.model_metadata.detect_local_server_type", return_value="ollama"):
             import httpx
             with patch.object(httpx, "Client", return_value=mock_ctx):
-                result = query_ollama_num_ctx("custom-model", "http://localhost:11434")
+                result = query_ollama_num_ctx("custom-model", "http://192.168.0.214:11434")
 
         assert result == 32768
 
@@ -76,7 +76,7 @@ class TestQueryOllamaNumCtx:
         with patch("agent.model_metadata.detect_local_server_type", return_value="ollama"):
             import httpx
             with patch.object(httpx, "Client", return_value=mock_ctx):
-                result = query_ollama_num_ctx("local:qwen2.5:7b", "http://localhost:11434/v1")
+                result = query_ollama_num_ctx("local:qwen2.5:7b", "http://192.168.0.214:11434/v1")
 
         # Verify the post was called with stripped name (no "local:" prefix)
         call_args = mock_client.post.call_args
@@ -94,7 +94,7 @@ class TestQueryOllamaNumCtx:
         with patch("agent.model_metadata.detect_local_server_type", return_value="ollama"):
             import httpx
             with patch.object(httpx, "Client", return_value=mock_ctx):
-                result = query_ollama_num_ctx("qwen2.5:32b", "http://localhost:11434")
+                result = query_ollama_num_ctx("qwen2.5:32b", "http://192.168.0.214:11434")
 
         assert result == 65536
 
@@ -110,7 +110,7 @@ class TestQueryOllamaSupportsVision:
         with patch("agent.model_metadata.detect_local_server_type", return_value="ollama"):
             import httpx
             with patch.object(httpx, "Client", return_value=mock_ctx):
-                result = query_ollama_supports_vision("gemma4:e2b", "http://localhost:11434/v1")
+                result = query_ollama_supports_vision("gemma4:e2b", "http://192.168.0.214:11434/v1")
 
         assert result is True
 
@@ -122,7 +122,7 @@ class TestQueryOllamaSupportsVision:
         with patch("agent.model_metadata.detect_local_server_type", return_value="ollama"):
             import httpx
             with patch.object(httpx, "Client", return_value=mock_ctx):
-                result = query_ollama_supports_vision("llava", "http://localhost:11434")
+                result = query_ollama_supports_vision("llava", "http://192.168.0.214:11434")
 
         assert result is True
 
