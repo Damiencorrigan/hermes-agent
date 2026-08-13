@@ -296,6 +296,42 @@ class RelayRuntime:
         )
         return result if isinstance(result, dict) else args
 
+    def _pop_scope_draining(
+        self,
+        session: RelaySession,
+        handle: Any,
+        *,
+        allow_closing: bool = False,
+        **pop_kwargs: Any,
+    ) -> None:
+        """Pop ``handle`` after draining any child scopes left on top.
+
+        ``nemo_relay`` enforces LIFO: ``scope.pop`` raises ``scope handle is
+        not at the top of the stack`` when a child scope (an interrupted turn,
+        or a leaked logical/tool scope) still sits above ``handle``.  Drain
+        descendants down to ``handle`` before the final pop so a broken turn
+        cannot wedge the session or turn scope close.  The drain is bounded
+        and only touches this session's own scope stack.
+        """
+        target_uuid = getattr(handle, "uuid", None)
+
+        def drain_and_pop() -> None:
+            if target_uuid is not None:
+                for _ in range(64):
+                    top = self.relay.scope.get_handle()
+                    top_uuid = getattr(top, "uuid", None)
+                    if top_uuid is None or top_uuid == target_uuid:
+                        break
+                    if getattr(top, "name", "") == "root":
+                        break
+                    try:
+                        self.relay.scope.pop(top)
+                    except Exception:
+                        break
+            self.relay.scope.pop(handle, **pop_kwargs)
+
+        self.run_in_session(session, drain_and_pop, allow_closing=allow_closing)
+
     def close_session(self, event: dict[str, Any]) -> None:
         """Close one session scope and remove it from the core registry."""
         session_id = _session_id(event)
@@ -313,9 +349,8 @@ class RelayRuntime:
             session.closing = True
             if session.handle is not None:
                 try:
-                    self.run_in_session(
+                    self._pop_scope_draining(
                         session,
-                        self.relay.scope.pop,
                         session.handle,
                         output={},
                         metadata={
@@ -685,9 +720,8 @@ class RelaySessionCoordinator:
                     self._finish_logical_calls(turn, outcome=outcome)
                     if turn.handle is not None:
                         try:
-                            lease.host.run_in_session(
+                            lease.host._pop_scope_draining(
                                 lease.session,
-                                lease.host.relay.scope.pop,
                                 turn.handle,
                                 output={"outcome": outcome},
                                 metadata={
