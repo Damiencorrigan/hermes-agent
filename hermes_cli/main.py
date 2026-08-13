@@ -2705,6 +2705,19 @@ def cmd_chat(args):
             accept_hooks=getattr(args, "accept_hooks", False),
         )
 
+    # Piped stdin → one-shot query.  Headless spawners (cron jobs, pipes)
+    # feed the prompt over a pipe; treat that as `chat -q <piped>` so the
+    # single turn runs to completion instead of the interactive loop reading
+    # EOF mid-turn and interrupting the agent before its first API call.
+    if getattr(args, "query", None) is None and getattr(args, "image", None) is None:
+        try:
+            if not sys.stdin.isatty():
+                _piped = sys.stdin.read()
+                if _piped and _piped.strip():
+                    args.query = _piped.strip()
+        except Exception:
+            pass
+
     # Import and run the CLI
     from cli import main as cli_main
 
