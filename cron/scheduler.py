@@ -4175,6 +4175,19 @@ def run_job(
                 or primary_provider_for_drift
             )
         except AuthError as auth_exc:
+            # A job that EXPLICITLY pins a provider (job["provider"]) is a
+            # deliberate routing choice: never silently substitute another
+            # provider on top of it (fleet rule 1/8: fail loud, never silently
+            # fall back). The pin is the operator's intent; if it cannot
+            # resolve, the job must record the TRUE reason (e.g. "provider
+            # dgx-ollama unresolvable") as last_error — not land on a
+            # substituted provider (S74 cron silent-failover fix).
+            _pinned_provider = str(job.get("provider") or "").strip()
+            if _pinned_provider:
+                raise RuntimeError(format_runtime_provider_error(auth_exc)) from auth_exc
+            # Unpinned jobs (no explicit pin) may still ride the operator's
+            # configured fallback chain — that is the operator's declared
+            # resilience intent, not a silent substitution.
             # Primary provider auth failed — try each configured provider/model
             # pair atomically. Keeping the primary model while changing only the
             # provider can silently route a paid GPT model through OpenRouter.
