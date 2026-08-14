@@ -1,0 +1,30 @@
+{
+  "version": "1.0-gates",
+  "updated": "2026-08-14",
+  "_comment": "hermes-agent guard surface — established 2026-08-14 (S50). Protects the agent core (agent/), the cron scheduler (cron/), and the tool layer (tools/). Tests: root pytest. No gates.json -> no guard; an ungoverned repo refuses agent merges.",
+  "default_tier": "B",
+  "tier_a_locked": true,
+  "actions": [
+    {
+      "id": "merge-main",
+      "tier": "C",
+      "description": "Merge to main after merge_guard MERGE-OK, or a recorded Damien approval (state=approved) covering the protected paths.",
+      "patterns": [
+        "merge.*(to |into )?main\\b",
+        "merge.*(pr|pull request)"
+      ],
+      "conditions": {
+        "require_merge_guard": true,
+        "require_tests_green": true,
+        "require_pre_commit": false,
+        "require_pr": true,
+        "protected_paths": [
+          "gates.json",
+          "agent/",
+          "cron/",
+          "tools/"
+        ]
+      }
+    }
+  ]
+}

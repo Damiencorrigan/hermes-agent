@@ -1586,6 +1586,7 @@ def create_job(
     attach_to_session: Optional[bool] = None,
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
+    critical: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1783,6 +1784,14 @@ def create_job(
     # global cron.mirror_delivery config, default off).
     if normalized_attach is not None:
         job["attach_to_session"] = normalized_attach
+    # Optional "critical" flag (bool), read by the scheduler's fleet
+    # cost-saving-mode gate (see cron/scheduler.py). Persisted only when
+    # explicitly set, so existing jobs stay byte-identical (absent key => false).
+    # Under cost-saving mode 2 a metered job is skipped UNLESS critical is true;
+    # under mode 3 everything metered is skipped regardless. See
+    # ~/ai-fleet/docs/cost-saving-modes.md.
+    if critical is not None:
+        job["critical"] = bool(critical)
 
     with _jobs_lock():
         jobs = load_jobs()
@@ -2073,29 +2082,35 @@ def remove_job(job_id: str) -> bool:
     return False
 
 
-def _set_preflight_alerted(job_id: str, value: bool) -> bool:
-    """Set/clear the preflight alert-dedup marker; return the PRIOR value.
+def _set_alert_flag(job_id: str, field: str, value: bool) -> bool:
+    """Set/clear a persisted alert-dedup marker; return the PRIOR value.
 
     The marker records that the operator was already alerted about this
-    job's blocked configuration, so the scheduler alerts exactly once and
-    stays silent on subsequent ticks until the config heals (same
-    alert-once shape as the dead-pin auto-pause in #73506). Persisted on
-    the job record so the dedup survives gateway restarts.
+    job's condition, so the scheduler alerts exactly once and stays silent
+    on subsequent ticks until the condition heals (same alert-once shape as
+    the dead-pin auto-pause in #73506). Persisted on the job record so the
+    dedup survives gateway restarts. Fields: ``preflight_alerted`` (blocked
+    config, T1-26) and ``drift_alerted`` (#44585 drift-guard skip).
     """
     with _jobs_lock():
         jobs = load_jobs()
         for i, job in enumerate(jobs):
             if job["id"] == job_id:
-                prior = bool(job.get("preflight_alerted"))
+                prior = bool(job.get(field))
                 if value:
-                    job["preflight_alerted"] = True
+                    job[field] = True
                 else:
-                    job.pop("preflight_alerted", None)
+                    job.pop(field, None)
                 if prior != value:
                     jobs[i] = job
                     save_jobs(jobs)
                 return prior
     return False
+
+
+def _set_preflight_alerted(job_id: str, value: bool) -> bool:
+    """Set/clear the preflight alert-dedup marker; return the PRIOR value."""
+    return _set_alert_flag(job_id, "preflight_alerted", value)
 
 
 def mark_preflight_alerted(job_id: str) -> bool:
@@ -2106,6 +2121,16 @@ def mark_preflight_alerted(job_id: str) -> bool:
 def clear_preflight_alerted(job_id: str) -> None:
     """Clear the preflight alert-dedup marker (config validates again)."""
     _set_preflight_alerted(job_id, False)
+
+
+def mark_drift_alerted(job_id: str) -> bool:
+    """Mark the job as drift-alerted; return True if it already was."""
+    return _set_alert_flag(job_id, "drift_alerted", True)
+
+
+def clear_drift_alerted(job_id: str) -> None:
+    """Clear the drift alert-dedup marker (resolution matches again)."""
+    _set_alert_flag(job_id, "drift_alerted", False)
 
 
 def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
@@ -2136,9 +2161,12 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 job["last_error"] = error if not success else None
                 # A healthy run means the configuration validates again — drop
                 # the preflight alert-dedup marker so a FUTURE config break
-                # re-alerts instead of being silently swallowed.
+                # re-alerts instead of being silently swallowed. Same contract
+                # for the drift marker (#44585 alert-once): a run that made it
+                # through the guard means resolution matches again.
                 if success:
                     job.pop("preflight_alerted", None)
+                    job.pop("drift_alerted", None)
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error
                 # Clear any external-fire claim so a re-armed recurring job can

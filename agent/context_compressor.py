@@ -4224,6 +4224,31 @@ This compaction should PRIORITISE preserving all information related to the focu
             # aborts the summary and compression falls back to a degraded static
             # marker, losing the real handoff (#23975). Re-entrant: a main-model
             # retry (_generate_summary recursion) re-enters harmlessly.
+            #
+            # Fleet cost-saving mode gate (Damien's 2026-07-31 ruling): the
+            # summariser is an UNATTENDED auxiliary call, so modes 2 and 3 gate
+            # it too — a metered aux provider must not be called while the fleet
+            # is economising. Degrade: prefer a local (dgx-ollama) client, else
+            # gracefully skip the summary (drop middle turns without one). NEVER
+            # raise — a broken summariser must not break the conversation loop.
+            try:
+                from agent.cost_mode import auxiliary_call_block_reason
+                _aux_mode_block = auxiliary_call_block_reason(
+                    _aux_provider or getattr(self, "provider", "")
+                )
+            except Exception:
+                _aux_mode_block = None
+            if _aux_mode_block:
+                logger.warning(
+                    "Context compression SKIPPED by fleet cost-saving mode "
+                    "(%s) — dropping middle turns without a summary rather than "
+                    "calling a metered summariser. Say 'cost saving mode off' to "
+                    "restore summaries.",
+                    _aux_mode_block,
+                )
+                self._last_summary_error = _aux_mode_block
+                return None
+
             _aux_call_start = time.monotonic()
             try:
                 with aux_interrupt_protection():
