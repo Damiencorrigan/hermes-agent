@@ -3479,6 +3479,28 @@ def delegate_task(
     except ValueError as exc:
         return tool_error(str(exc))
 
+    # Fleet cost-saving mode 3 (lockdown): refuse to spawn a subagent on a
+    # metered lane — the child would spend on every turn, and the dispatch is
+    # the cheapest point to stop it. Modes 2/1/off: no gate (the parent agent
+    # holds the "is this critical" judgement mode 2 asks for).
+    _child_provider = (
+        creds.get("provider") or getattr(parent_agent, "provider", "") or ""
+    )
+    _dispatch_skip = None
+    try:
+        from agent.cost_mode import delegation_dispatch_reason
+        _dispatch_skip = delegation_dispatch_reason(_child_provider)
+    except Exception:
+        _dispatch_skip = None
+    if _dispatch_skip:
+        return tool_error(
+            f"delegate_task REFUSED by fleet cost-saving mode 3 (lockdown): "
+            f"the subagent would run on metered provider '{_child_provider}', "
+            f"and mode 3 blocks every paid lane. Only local/$0 providers "
+            f"(ollama, lmstudio, vllm, llamacpp) run. Say 'cost saving mode "
+            f"off' to restore, or set delegation.provider to a local lane."
+        )
+
     # Normalize to task list
     max_children = _get_max_concurrent_children()
     recovered_tasks, tasks_error = _recover_tasks_from_json_string(tasks)

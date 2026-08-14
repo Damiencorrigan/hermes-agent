@@ -1586,6 +1586,7 @@ def create_job(
     attach_to_session: Optional[bool] = None,
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
+    critical: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1777,23 +1778,20 @@ def create_job(
         "origin": origin,  # Tracks where job was created for "origin" delivery
         "enabled_toolsets": normalized_toolsets,
         "workdir": normalized_workdir,
-        # NOTE — optional flag "critical" (bool), read by the scheduler's
-        # fleet cost-saving-mode gate (see cron/scheduler.py, "Fleet
-        # cost-saving mode gate"). It is deliberately NOT set here: absent
-        # means false, and the flag is an operator judgement ("this job is
-        # worth paid tokens even while the fleet is economising"), not
-        # something job creation can infer. Set it by hand in
-        # ~/.hermes/cron/jobs.json — unknown keys survive load/save
-        # round-trips, so it persists. Effect: under cost-saving mode 2 a
-        # metered job is skipped UNLESS critical is true; under mode 3
-        # everything metered is skipped regardless. See
-        # ~/ai-fleet/docs/cost-saving-modes.md.
     }
     # Only persist attach_to_session when explicitly set, so existing jobs and
     # the common case stay byte-identical (absent key => fall back to the
     # global cron.mirror_delivery config, default off).
     if normalized_attach is not None:
         job["attach_to_session"] = normalized_attach
+    # Optional "critical" flag (bool), read by the scheduler's fleet
+    # cost-saving-mode gate (see cron/scheduler.py). Persisted only when
+    # explicitly set, so existing jobs stay byte-identical (absent key => false).
+    # Under cost-saving mode 2 a metered job is skipped UNLESS critical is true;
+    # under mode 3 everything metered is skipped regardless. See
+    # ~/ai-fleet/docs/cost-saving-modes.md.
+    if critical is not None:
+        job["critical"] = bool(critical)
 
     with _jobs_lock():
         jobs = load_jobs()

@@ -285,3 +285,54 @@ def session_banner() -> Optional[str]:
         )
     except Exception:
         return None
+
+
+def delegation_dispatch_reason(provider: Any) -> Optional[str]:
+    """Reason a ``delegate_task`` subagent dispatch must be refused, else ``None``.
+
+    Mode 3 (lockdown): refuse to spawn a child on a metered lane — the child
+    spends on every one of its turns, and the dispatch is the cheapest place to
+    stop it (before the subagent exists).  Modes 2 / 1 / off: no hard gate —
+    a delegation is a live-session action and the parent agent exercises the
+    "is this critical" judgement that mode 2 asks for.
+
+    Never raises (fail-open), for the same reason as the rest of this module.
+    """
+    try:
+        if read_cost_mode() != "3":
+            return None
+        name = (str(provider or "")).strip().lower()
+        if not is_metered_provider(name):
+            return None
+        return f"cost_saving_mode_3_lockdown:{name}"
+    except Exception as exc:  # fail OPEN
+        logger.warning("cost-mode delegation gate error (%s) — not refusing",
+                       type(exc).__name__)
+        return None
+
+
+def auxiliary_call_block_reason(provider: Any) -> Optional[str]:
+    """Reason an auxiliary client call (the context-compression summariser)
+    must be downgraded-or-skipped under modes 2 / 3, else ``None``.
+
+    Unlike the live-session main path, the summariser is unattended, so BOTH
+    mode 2 (free-first) and mode 3 (lockdown) gate it: a metered aux provider
+    must not be called while the fleet is economising.  The caller degrades —
+    prefer a local (dgx-ollama) client, else gracefully skip the aux work — and
+    must NEVER raise on this, because a broken summariser must not break the
+    conversation loop.
+
+    Never raises (fail-open), for the same reason as the rest of this module.
+    """
+    try:
+        mode = read_cost_mode()
+        if mode not in ("2", "3"):
+            return None
+        name = (str(provider or "")).strip().lower()
+        if not is_metered_provider(name):
+            return None
+        return f"cost_saving_mode_{mode}_aux_block:{name}"
+    except Exception as exc:  # fail OPEN
+        logger.warning("cost-mode aux gate error (%s) — not skipping",
+                       type(exc).__name__)
+        return None

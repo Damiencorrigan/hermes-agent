@@ -326,3 +326,36 @@ def test_live_state_file_shape(monkeypatch):
     monkeypatch.setattr(cm, "COST_MODE_FILE", _REAL_COST_MODE_FILE)
     cm._reset_cache_for_tests()
     assert cm.read_cost_mode() in cm.VALID_MODES
+
+
+# ── aux gates (S50): delegation dispatch + auxiliary (compression) call ─────
+
+def test_delegation_dispatch_reason_blocks_metered_in_mode_3(_mode_file):
+    _set_mode(_mode_file, "3")
+    assert cm.delegation_dispatch_reason("gemini") == "cost_saving_mode_3_lockdown:gemini"
+    assert cm.delegation_dispatch_reason("ollama") is None
+
+
+@pytest.mark.parametrize("mode", ["off", "1", "2"])
+def test_delegation_dispatch_reason_inert_below_lockdown(_mode_file, mode):
+    _set_mode(_mode_file, mode)
+    assert cm.delegation_dispatch_reason("gemini") is None
+
+
+def test_auxiliary_call_block_reason_blocks_metered_in_modes_2_and_3(_mode_file):
+    _set_mode(_mode_file, "2")
+    assert cm.auxiliary_call_block_reason("gemini") == "cost_saving_mode_2_aux_block:gemini"
+    _set_mode(_mode_file, "3")
+    assert cm.auxiliary_call_block_reason("deepseek") == "cost_saving_mode_3_aux_block:deepseek"
+
+
+def test_auxiliary_call_block_reason_allows_local_and_low_modes(_mode_file):
+    _set_mode(_mode_file, "3")
+    assert cm.auxiliary_call_block_reason("ollama") is None
+    _set_mode(_mode_file, "2")
+    assert cm.auxiliary_call_block_reason("lmstudio") is None
+    _set_mode(_mode_file, "1")
+    assert cm.auxiliary_call_block_reason("gemini") is None
+    _set_mode(_mode_file, "off")
+    assert cm.auxiliary_call_block_reason("gemini") is None
+
