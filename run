@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Root-level test entrypoint (merge_guard `./run test` convention).
+#
+# merge_guard's tests-green gate runs a repo's declared whole-suite runner
+# when it finds one (S111 suite-runner parity): an executable ./run with a
+# `test` case, or scripts/run_tests.sh. This script is that declaration — it
+# execs the canonical clean-env 12-worker runner so the guard's evidence is
+# identical to a direct `scripts/run_tests.sh` invocation (TZ=UTC,
+# LANG=C.UTF-8, PYTHONHASHSEED=0, per-file isolation).
+set -euo pipefail
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+case "${1:-}" in
+  test)
+    shift
+    exec "$REPO_ROOT/scripts/run_tests.sh" "$@"
+    ;;
+  *)
+    echo "usage: ./run test [pytest-flags...]" >&2
+    echo "  execs scripts/run_tests.sh — the canonical clean-env 12-worker suite" >&2
+    exit 2
+    ;;
+esac
