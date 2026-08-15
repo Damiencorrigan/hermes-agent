@@ -7,6 +7,8 @@ the optional otlp extra is not installed.
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 otel = pytest.importorskip("opentelemetry.sdk.trace", reason="otlp extra not installed")
@@ -116,3 +118,95 @@ def test_failing_streamer_never_breaks_emitter(monkeypatch):
     em.flush()
     em.close()
     assert len(seen) == 1
+
+
+# ---------------------------------------------------------------------------
+# S101: collector reachability gate at telemetry init.
+# ---------------------------------------------------------------------------
+
+
+def _otlp_enabled_config(endpoint: str) -> dict:
+    return {
+        "monitoring": {
+            "export": {"otlp": {"enabled": True, "endpoint": endpoint}},
+        }
+    }
+
+
+def test_start_streaming_disables_exporter_when_collector_unreachable(caplog):
+    """A configured-but-down collector disables the exporter with ONE warning.
+
+    Regression (S101): the OTLP HTTP exporter retries failed exports with
+    backoff, so an unset collector at localhost:3000 produced 27,591
+    connection-refused retries in the gateway log.  Port 1 refuses the TCP
+    probe instantly; the exporter must not be constructed.
+    """
+    caplog.set_level(logging.WARNING, logger="agent.monitoring.otlp_exporter")
+    endpoint = "http://127.0.0.1:1"
+    assert OE.start_streaming(_otlp_enabled_config(endpoint)) is None
+
+    records = [
+        r
+        for r in caplog.records
+        if r.name == "agent.monitoring.otlp_exporter"
+        and r.levelno == logging.WARNING
+    ]
+    assert len(records) == 1, "exactly one warning at exporter init"
+    assert endpoint in records[0].getMessage()
+
+
+def test_start_streaming_unchanged_when_collector_reachable(
+    monkeypatch, caplog
+):
+    """A reachable collector leaves exporter init exactly as before."""
+    caplog.set_level(logging.WARNING, logger="agent.monitoring.otlp_exporter")
+    endpoint = "http://127.0.0.1:1"
+    monkeypatch.setattr(OE, "probe_collector", lambda endpoint, **kw: True)
+
+    class _FakeStreamer:
+        def __init__(self, cfg, *, event_filter=None):
+            self.cfg = cfg
+            self.event_filter = event_filter
+
+        def shutdown(self):
+            pass
+
+    monkeypatch.setattr(OE, "OTLPStreamer", _FakeStreamer)
+    streamer = OE.start_streaming(
+        _otlp_enabled_config(endpoint), event_filter=lambda ev: True
+    )
+    assert isinstance(streamer, _FakeStreamer), "streamer configured as before"
+    assert streamer.event_filter is not None
+
+    records = [
+        r
+        for r in caplog.records
+        if r.name == "agent.monitoring.otlp_exporter"
+        and r.levelno == logging.WARNING
+    ]
+    assert records == [], "no warning on the healthy path"
+
+
+def test_probe_collector_true_when_endpoint_listening():
+    import socket
+
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(2)
+    port = srv.getsockname()[1]
+    try:
+        assert OE.probe_collector(f"http://127.0.0.1:{port}") is True
+        # Drain the accept queue so the next connect is not dropped.
+        conn, _ = srv.accept()
+        conn.close()
+        # Scheme-less endpoints (as configured for self-hosted langfuse) probe too.
+        assert OE.probe_collector(f"127.0.0.1:{port}") is True
+    finally:
+        srv.close()
+
+
+def test_probe_collector_false_on_refused_and_malformed():
+    assert OE.probe_collector("http://127.0.0.1:1") is False  # refused
+    assert OE.probe_collector("") is False
+    assert OE.probe_collector("file:///tmp/x") is False
+    assert OE.probe_collector("not a url") is False

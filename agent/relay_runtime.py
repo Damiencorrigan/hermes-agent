@@ -32,6 +32,12 @@ _PROFILE_KEY_CACHE: dict[str, str] = {}
 # is one lost span, never a blocked agent (2026-08-10 delegation stall).
 _SCOPE_OP_TIMEOUT = 10.0
 
+# Keyword arguments ``nemo_relay.scope.pop`` accepts.  Anything else (e.g.
+# a caller-side ``timeout``) must be routed to ``run_in_session`` instead of
+# forwarded into the native call (S101: live ``TypeError: pop() got an
+# unexpected keyword argument 'timeout'`` in the gateway, 2026-08-15).
+_SCOPE_POP_KWARGS = frozenset({"output", "metadata", "timestamp"})
+
 _SCOPE_OP_EXECUTOR: Any = None
 _SCOPE_OP_EXECUTOR_LOCK = threading.Lock()
 
@@ -559,8 +565,31 @@ class RelayRuntime:
         descendants down to ``handle`` before the final pop so a broken turn
         cannot wedge the session or turn scope close.  The drain is bounded
         and only touches this session's own scope stack.
+
+        ``**pop_kwargs`` carries the final ``scope.pop`` payload
+        (``output``/``metadata``/``timestamp``) plus an optional caller-side
+        ``timeout`` that bounds the whole drain+pop.  ``timeout`` is routed
+        to ``run_in_session`` — whose executor honors it — never forwarded
+        into the native call: ``nemo_relay.scope.pop`` accepts only
+        ``output``/``metadata``/``timestamp`` (S101 regression: forwarding
+        ``timeout`` raised ``TypeError: pop() got an unexpected keyword
+        argument 'timeout'`` in the gateway).  Any other unexpected kwarg
+        fails loud instead of being silently dropped.
         """
         target_uuid = getattr(handle, "uuid", None)
+
+        timeout = pop_kwargs.pop("timeout", None)
+        unknown = sorted(set(pop_kwargs) - _SCOPE_POP_KWARGS)
+        if unknown:
+            raise TypeError(
+                "scope.pop() got unexpected keyword argument(s): "
+                + ", ".join(repr(name) for name in unknown)
+            )
+        scope_kwargs = {
+            name: pop_kwargs[name]
+            for name in _SCOPE_POP_KWARGS
+            if name in pop_kwargs
+        }
 
         def drain_and_pop() -> None:
             if target_uuid is not None:
@@ -575,9 +604,14 @@ class RelayRuntime:
                         self.relay.scope.pop(top)
                     except Exception:
                         break
-            self.relay.scope.pop(handle, **pop_kwargs)
+            self.relay.scope.pop(handle, **scope_kwargs)
 
-        self.run_in_session(session, drain_and_pop, allow_closing=allow_closing)
+        self.run_in_session(
+            session,
+            drain_and_pop,
+            allow_closing=allow_closing,
+            timeout=timeout,
+        )
 
     def close_session(self, event: dict[str, Any]) -> None:
         """Close one session scope and remove it from the core registry."""
