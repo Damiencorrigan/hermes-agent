@@ -118,3 +118,66 @@ def test_install_id_persists_across_calls(tmp_path, monkeypatch):
     assert first in (tmp_path / "config.yaml").read_text()
 
 
+def _enabled_export_config(endpoint: str) -> dict:
+    return {
+        "monitoring": {
+            "gateway_health_export": {"enabled": True},
+            "export": {"otlp": {"enabled": True, "endpoint": endpoint}},
+        }
+    }
+
+
+def test_start_gateway_health_export_disables_when_collector_unreachable(
+    monkeypatch, caplog
+):
+    """S101: unreachable collector disables the whole exporter with ONE warning.
+
+    The single probe at telemetry init must stop every OTLP plane (metrics,
+    spans, diagnostic logs) before any exporter is constructed — each plane
+    retries failed exports with backoff, so proceeding would flood the
+    gateway log with connection-refused retries.
+    """
+    from agent.monitoring import otlp_exporter
+    from agent.monitoring.gateway_health_export import start_gateway_health_export
+
+    caplog.set_level(logging.WARNING, logger="agent.monitoring.gateway_health_export")
+    endpoint = "http://127.0.0.1:1"
+    monkeypatch.setattr(otlp_exporter, "probe_collector", lambda endpoint, **kw: False)
+
+    runtime = start_gateway_health_export(_enabled_export_config(endpoint))
+
+    assert runtime.enabled is False
+    assert runtime.reason == "collector_unreachable"
+    records = [
+        r
+        for r in caplog.records
+        if r.name == "agent.monitoring.gateway_health_export"
+        and r.levelno == logging.WARNING
+    ]
+    assert len(records) == 1, "exactly one warning at exporter init"
+    assert endpoint in records[0].getMessage()
+
+
+def test_start_gateway_health_export_proceeds_when_collector_reachable(
+    monkeypatch,
+):
+    """S101: a reachable collector leaves the init path unchanged."""
+    from agent.monitoring import otlp_exporter
+    import agent.monitoring.gateway_health_export as GHE
+
+    endpoint = "http://127.0.0.1:1"
+    monkeypatch.setattr(otlp_exporter, "probe_collector", lambda endpoint, **kw: True)
+
+    def _sdk_unavailable(*args, **kwargs):
+        raise RuntimeError("sdk unavailable")
+
+    monkeypatch.setattr(GHE, "_require_metrics_sdk", _sdk_unavailable)
+
+    runtime = GHE.start_gateway_health_export(_enabled_export_config(endpoint))
+
+    # Passed the probe and took the normal path: the SDK availability check
+    # was reached (and failed only because the test stubbed it).
+    assert runtime.enabled is False
+    assert runtime.reason == "otlp_unavailable"
+
+

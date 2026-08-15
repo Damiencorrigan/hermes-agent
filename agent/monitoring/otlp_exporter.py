@@ -104,6 +104,39 @@ def _otlp_config(config: Dict[str, Any]) -> Dict[str, Any]:
     return export.get("otlp") or {}
 
 
+def probe_collector(endpoint: str, *, timeout: float = 1.0) -> bool:
+    """Fast reachability probe of an OTLP collector endpoint.
+
+    One bounded TCP connect to the endpoint's host:port.  Connection-level
+    reachability is the correct health signal at telemetry init: the OTLP
+    HTTP exporters retry failed exports with backoff, so a configured-but-
+    down collector turns every span/log/metric export into a retry flood
+    (S101: 27,591 connection-refused retries against an unset langfuse
+    collector at localhost:3000).  Returns True when the collector accepts
+    connections; False on any failure (DNS, refused, timeout, malformed
+    URL, unsupported scheme).  Never raises, never logs.
+    """
+    import socket
+    from urllib.parse import urlsplit
+
+    try:
+        raw = str(endpoint or "")
+        if "://" not in raw:
+            raw = "http://" + raw
+        parts = urlsplit(raw)
+        scheme = (parts.scheme or "http").lower()
+        if scheme not in ("http", "https"):
+            return False
+        host = parts.hostname
+        if not host:
+            return False
+        port = parts.port or (443 if scheme == "https" else 80)
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
 def build_exporter(config: Dict[str, Any]):
     """Construct an OTLP span exporter from config. Raises OTLPUnavailable if no SDK."""
     sdk = _require_sdk()
@@ -246,6 +279,21 @@ def start_streaming(
     no-ops — never blocks or raises into startup.
     """
     if not is_enabled(config):
+        return None
+    otlp = _otlp_config(config)
+    endpoint = str(otlp.get("endpoint") or "")
+    # One fast reachability probe at telemetry init.  A configured-but-down
+    # collector must disable the exporter immediately with a single warning
+    # — the OTLP HTTP exporter retries failed exports with backoff, so
+    # proceeding here would flood the logs with per-span connection-refused
+    # retries (S101: 27,591 retries against an unset langfuse collector at
+    # localhost:3000).
+    if not probe_collector(endpoint):
+        logger.warning(
+            "monitoring.export.otlp collector %s unreachable; OTLP export "
+            "disabled — start the collector and restart the gateway to enable",
+            endpoint,
+        )
         return None
     try:
         _require_sdk(prompt=False)

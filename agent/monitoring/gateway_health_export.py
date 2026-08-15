@@ -588,6 +588,23 @@ def start_gateway_health_export(config: Dict[str, Any]) -> GatewayHealthExportRu
     """Start P0 gateway health export if configured. Never raises."""
     if not _enabled(config):
         return GatewayHealthExportRuntime(enabled=False, reason="disabled")
+    from agent.monitoring import otlp_exporter
+
+    # ONE fast reachability probe of the collector endpoint at telemetry
+    # init.  A configured-but-down collector disables the whole exporter
+    # (metrics, spans, and diagnostic logs alike) with a single warning —
+    # every OTLP plane retries failed exports with backoff, so proceeding
+    # would flood the logs with connection-refused retries (S101: 27,591
+    # retries against an unset langfuse collector at localhost:3000).
+    otlp = _otlp_config(config)
+    endpoint = str(otlp.get("endpoint") or "")
+    if not otlp_exporter.probe_collector(endpoint):
+        logger.warning(
+            "gateway health OTLP export disabled: collector %s unreachable "
+            "(single probe at init; no retry flood)",
+            endpoint,
+        )
+        return GatewayHealthExportRuntime(enabled=False, reason="collector_unreachable")
     gh = _gateway_health_config(config)
     runtime = GatewayHealthExportRuntime(enabled=True, reason="enabled")
     sdk: Optional[Dict[str, Any]] = None

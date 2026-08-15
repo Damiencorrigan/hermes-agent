@@ -47,23 +47,41 @@ class _ScopeHandle:
 
 
 class _FakeScopeModule:
-    """Stands in for ``nemo_relay.scope`` with a controllable pop."""
+    """Stands in for ``nemo_relay.scope`` with a controllable pop.
+
+    ``pop`` mirrors the real binding's strict keyword-only signature
+    (``output``/``metadata``/``timestamp`` only) so a kwarg routed into the
+    native call by mistake — e.g. a caller-side ``timeout`` — fails exactly
+    like it does in production instead of being absorbed by a permissive
+    ``**kwargs`` (S101 regression).
+    """
 
     def __init__(self, wedge_event: threading.Event | None = None) -> None:
         self._wedge = wedge_event
         self.pushed: list[str] = []
         self.popped: list[str] = []
+        self.pop_kwargs: list[dict[str, Any]] = []
 
     def push(self, name: str, scope_type: Any, **kwargs: Any) -> _ScopeHandle:
         self.pushed.append(name)
         return _ScopeHandle(name)
 
-    def pop(self, handle: _ScopeHandle, **kwargs: Any) -> None:
+    def pop(
+        self,
+        handle: _ScopeHandle,
+        *,
+        output: Any = None,
+        metadata: Any = None,
+        timestamp: Any = None,
+    ) -> None:
         if self._wedge is not None:
             # Simulates the wedged native pipeline: blocks until the event
             # is set — which the tests never do.
             self._wedge.wait()
         self.popped.append(handle.name)
+        self.pop_kwargs.append(
+            {"output": output, "metadata": metadata, "timestamp": timestamp}
+        )
 
     def event(self, *args: Any, **kwargs: Any) -> None:
         return None
@@ -286,3 +304,94 @@ class TestHealthyPathUnchanged:
             "healthy-path pop must complete before end_turn returns "
             "(no fire-and-forget on the default lane)"
         )
+
+
+class TestPopTimeoutKwargRouting:
+    """S101 regression: a caller-side ``timeout`` must never reach the pop.
+
+    Live 2026-08-15: ``_pop_scope_draining`` forwarded every ``**pop_kwargs``
+    entry — including ``timeout=_SCOPE_OP_TIMEOUT`` passed by ``end_turn``
+    and ``close_session`` — straight into ``nemo_relay.scope.pop``, whose
+    real signature accepts only ``output``/``metadata``/``timestamp``.  The
+    gateway logged 104 ``TypeError: pop() got an unexpected keyword argument
+    'timeout'`` hits.  The fix routes ``timeout`` to ``run_in_session``
+    (whose executor already honors the bound) and forwards only the
+    accepted kwargs into the native call.  The strict fake ``pop`` above
+    mirrors the real signature, so this test is red on the unfixed code.
+    """
+
+    def test_end_turn_with_timeout_kwarg_pops_without_type_error(
+        self, coordinator
+    ):
+        """end_turn's timeout= kwarg drains and pops without a TypeError."""
+        runtime = _make_runtime(_FakeRelay())
+        lease = _acquire(coordinator, runtime)
+        turn = coordinator.begin_turn(lease, turn_id="t1", task_id="task1")
+        assert turn.handle is not None, "turn scope must push on fake relay"
+
+        # end_turn passes timeout=_SCOPE_OP_TIMEOUT into _pop_scope_draining;
+        # with the unfixed code the strict fake pop raises TypeError here.
+        coordinator.end_turn(turn, outcome="success")
+
+        assert relay_runtime.TURN_SCOPE in runtime.relay.scope.popped, (
+            "turn scope must be popped after end_turn"
+        )
+
+    def test_close_session_with_timeout_kwarg_pops_without_type_error(
+        self, coordinator
+    ):
+        """close_session's timeout= kwarg closes the session scope cleanly."""
+        runtime = _make_runtime(_FakeRelay())
+        lease = _acquire(coordinator, runtime)
+        assert lease.session is not None, "fake session must initialize"
+
+        # close_session passes output=, metadata= AND timeout= into
+        # _pop_scope_draining; only output/metadata may reach the pop.
+        runtime.close_session({"session_id": "sess-1"})
+
+        assert relay_runtime.SESSION_SCOPE in runtime.relay.scope.popped, (
+            "session scope must be popped after close_session"
+        )
+        popped_kwargs = runtime.relay.scope.pop_kwargs[-1]
+        assert "timeout" not in popped_kwargs, (
+            "timeout must never be forwarded into scope.pop"
+        )
+        assert popped_kwargs["output"] == {}, (
+            "close_session's output payload must reach the native pop"
+        )
+
+    def test_drain_and_pop_routes_timeout_and_keeps_payload(self, coordinator):
+        """Direct drain_and_pop: timeout routed, payload forwarded intact."""
+        runtime = _make_runtime(_FakeRelay())
+        lease = _acquire(coordinator, runtime)
+        turn = coordinator.begin_turn(lease, turn_id="t1", task_id="task1")
+        assert turn.handle is not None
+
+        runtime._pop_scope_draining(
+            lease.session,
+            turn.handle,
+            output={"outcome": "success"},
+            metadata={"k": "v"},
+            timeout=3.0,
+        )
+
+        assert runtime.relay.scope.popped == [relay_runtime.TURN_SCOPE]
+        popped_kwargs = runtime.relay.scope.pop_kwargs[-1]
+        assert popped_kwargs["output"] == {"outcome": "success"}
+        assert popped_kwargs["metadata"] == {"k": "v"}
+        assert "timeout" not in popped_kwargs
+
+    def test_drain_and_pop_fails_loud_on_unknown_kwarg(self, coordinator):
+        """Unknown kwargs still fail loud — no silent dropping."""
+        runtime = _make_runtime(_FakeRelay())
+        lease = _acquire(coordinator, runtime)
+        turn = coordinator.begin_turn(lease, turn_id="t1", task_id="task1")
+        assert turn.handle is not None
+
+        with pytest.raises(TypeError, match="unexpected keyword argument"):
+            runtime._pop_scope_draining(
+                lease.session,
+                turn.handle,
+                bogus_kwarg=1,
+                timeout=3.0,
+            )
