@@ -96,8 +96,21 @@ custom = CustomProfile(
     # Without this, no max_tokens is sent and Ollama falls back to its internal
     # num_predict=128, truncating responses after a few tokens (#39281). This is
     # only a floor used when the user hasn't set model.max_tokens — they can
-    # override per-model — so we set it generously rather than lowballing it.
-    default_max_tokens=65536,
+    # override per-model.
+    #
+    # Was 65536 ("generously" == equal to this model's context_length). That
+    # is the whole context window, not a completion budget: strict backends
+    # (vLLM) reject prompt_tokens + max_tokens > context_length server-side
+    # with an instant HTTP 400 before generation starts, on every tool-call
+    # request whose skills/system prompt is non-trivial (30K+ tokens is
+    # normal here) — 100% failure, deterministic, content-independent.
+    # Ollama tolerates the same overshoot (silently clamps), which is why
+    # only the vLLM lane 400'd while the ollama fallback "worked" (slow).
+    # 4096 is a sane completion budget that still clears the num_predict=128
+    # floor by 32x, and leaves headroom under context_length for prompts up
+    # to ~60K tokens on a 65536-token window. Users needing longer output
+    # still set model.max_tokens explicitly (checked first, above).
+    default_max_tokens=4096,
 )
 
 register_provider(custom)
