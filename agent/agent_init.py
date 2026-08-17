@@ -2426,6 +2426,24 @@ def init_agent(
     agent._custom_providers = _custom_providers
     _merge_custom_provider_extra_body(agent, _custom_providers)
 
+    # Check custom_providers per-provider max_output_tokens override — lets
+    # ``providers.<key>.max_output_tokens`` in config.yaml raise/lower a
+    # provider's static completion-token cap (e.g. the shared "custom"
+    # profile's 4096 floor) without a core release. Same precedence slot as
+    # ``model.max_tokens`` above (only applies when that wasn't already set).
+    if agent.max_tokens is None and _custom_providers:
+        try:
+            from hermes_cli.config import get_custom_provider_max_output_tokens
+            _cp_max_tokens = get_custom_provider_max_output_tokens(
+                base_url=agent.base_url,
+                custom_providers=_custom_providers,
+            )
+            if _cp_max_tokens:
+                agent.max_tokens = int(_cp_max_tokens)
+                agent._session_init_model_config["max_tokens"] = agent.max_tokens
+        except Exception:
+            pass
+
     # Check custom_providers per-model context_length
     if _config_context_length is None and _custom_providers:
         try:
