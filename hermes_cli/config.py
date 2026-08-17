@@ -1325,7 +1325,7 @@ def _normalize_custom_provider_entry(
         "provider",
         "name", "api", "url", "base_url", "api_key", "key_env", "api_key_env",
         "api_mode", "transport", "model", "default_model", "models",
-        "context_length", "rate_limit_delay",
+        "context_length", "rate_limit_delay", "max_output_tokens",
         "request_timeout_seconds", "stale_timeout_seconds",
         "discover_models", "extra_body", "extra_headers",
         "ssl_ca_cert", "ssl_verify",
@@ -1448,6 +1448,15 @@ def _normalize_custom_provider_entry(
     if isinstance(rate_limit_delay, (int, float)) and rate_limit_delay >= 0:
         normalized["rate_limit_delay"] = rate_limit_delay
 
+    # Per-provider completion-token cap override (#41xxx): lets a profile
+    # override a provider's static ``default_max_tokens`` (e.g. the shared
+    # "custom" profile's 4096 floor) without waiting for a core release.
+    max_output_tokens = entry.get("max_output_tokens")
+    if isinstance(max_output_tokens, bool):
+        pass
+    elif isinstance(max_output_tokens, (int, float)) and max_output_tokens > 0:
+        normalized["max_output_tokens"] = int(max_output_tokens)
+
     discover_models = entry.get("discover_models")
     if isinstance(discover_models, bool):
         normalized["discover_models"] = discover_models
@@ -1498,6 +1507,7 @@ def _custom_provider_entry_to_provider_config(
         "models",
         "context_length",
         "rate_limit_delay",
+        "max_output_tokens",
         "discover_models",
         "extra_body",
         "extra_headers",
@@ -1779,6 +1789,57 @@ def get_custom_provider_context_length(
             continue
         if ctx > 0:
             return ctx
+    return None
+
+
+def get_custom_provider_max_output_tokens(
+    base_url: str,
+    custom_providers: Optional[List[Dict[str, Any]]] = None,
+    config: Optional[Dict[str, Any]] = None,
+) -> Optional[int]:
+    """Look up a per-provider ``max_output_tokens`` override from ``custom_providers``.
+
+    Matches any entry whose normalized route identity equals ``base_url`` and
+    returns its ``max_output_tokens`` if present and valid. Returns ``None``
+    when no override applies (caller falls back to the provider profile's
+    static ``default_max_tokens``, e.g. 4096 for the shared "custom" profile).
+
+    Provider-level (not per-model): ``providers.<key>.max_output_tokens`` in
+    config.yaml, distinct from the per-model ``models.<model>.context_length``
+    override handled by ``get_custom_provider_context_length``.
+    """
+    if not base_url:
+        return None
+    if custom_providers is None:
+        try:
+            custom_providers = get_compatible_custom_providers(config)
+        except Exception:
+            if config is None:
+                return None
+            raw = config.get("custom_providers")
+            custom_providers = raw if isinstance(raw, list) else []
+    if not isinstance(custom_providers, list):
+        return None
+
+    target_url = normalize_route_base_url(base_url)
+    if not target_url:
+        return None
+
+    for entry in custom_providers:
+        if not isinstance(entry, dict):
+            continue
+        entry_url = normalize_route_base_url(entry.get("base_url"))
+        if not entry_url or entry_url != target_url:
+            continue
+        raw_max = entry.get("max_output_tokens")
+        if raw_max is None:
+            continue
+        try:
+            max_tokens = int(raw_max)
+        except (TypeError, ValueError):
+            continue
+        if max_tokens > 0:
+            return max_tokens
     return None
 
 
