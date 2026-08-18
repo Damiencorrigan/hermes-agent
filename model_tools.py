@@ -626,7 +626,8 @@ def _compute_tool_definitions(
                           "none": "no listing (search-only)"}
                 print(
                     f"🔎 Tool Search (tier {assembly.tier}): {assembly.deferred_count} "
-                    f"MCP/plugin tools deferred (~{assembly.deferred_tokens} tokens) behind "
+                    f"{'core+plugin' if ts_cfg.extend_to_core else 'MCP/plugin'} tools deferred "
+                    f"(~{assembly.deferred_tokens} tokens) behind "
                     f"tool_search/describe/call — {_forms.get(assembly.listing_form, assembly.listing_form)}."
                 )
             filtered_tools = assembly.tool_defs
@@ -1264,11 +1265,22 @@ def handle_function_call(
             ) or []
         except Exception:
             current_defs = []
+        # Thread the resolved tool-search config into every bridge call so
+        # the opt-in core-deferral decision (extend_to_core, S205 design)
+        # applies consistently to search/describe/dispatch. When the key is
+        # unset the config carries the default (core tools never defer), so
+        # this is a no-op for every non-opted-in profile.
+        try:
+            from tools.tool_search import load_config as _load_ts_config
+            _bridge_ts_cfg = _load_ts_config()
+        except Exception:
+            _bridge_ts_cfg = None
         if function_name == _ts_mod.TOOL_SEARCH_NAME:
             return _return_bridge_result(
                 _ts_mod.dispatch_tool_search(
                     function_args or {},
                     current_tool_defs=current_defs,
+                    config=_bridge_ts_cfg,
                 )
             )
         if function_name == _ts_mod.TOOL_DESCRIBE_NAME:
@@ -1276,10 +1288,13 @@ def handle_function_call(
                 _ts_mod.dispatch_tool_describe(
                     function_args or {},
                     current_tool_defs=current_defs,
+                    config=_bridge_ts_cfg,
                 )
             )
         if function_name == _ts_mod.TOOL_CALL_NAME:
-            underlying_name, underlying_args, err = _ts_mod.resolve_underlying_call(function_args or {})
+            underlying_name, underlying_args, err = _ts_mod.resolve_underlying_call(
+                function_args or {}, config=_bridge_ts_cfg
+            )
             if err or not underlying_name:
                 return _return_bridge_result(
                     tool_error(err or "tool_call could not be resolved")
@@ -1290,7 +1305,7 @@ def handle_function_call(
             # additionally rejects any tool the session was not granted, so a
             # restricted session can never invoke an out-of-scope tool through
             # the bridge even if the catalog scoping above regressed.
-            _scoped_deferrable = _ts_mod.scoped_deferrable_names(current_defs)
+            _scoped_deferrable = _ts_mod.scoped_deferrable_names(current_defs, config=_bridge_ts_cfg)
             if underlying_name not in _scoped_deferrable:
                 return _return_bridge_result(
                     tool_error(

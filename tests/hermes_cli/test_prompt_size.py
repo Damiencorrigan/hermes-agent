@@ -117,5 +117,65 @@ def test_skills_breakdown_attributes_demoted_category_shared_line(isolated_home)
         assert entry["index_line_skill_count"] == 2
 
 
+def test_extend_to_core_executor_toolset_schema_tokens_under_6000(isolated_home):
+    """S205 design §5: an executor-shaped all-core toolset under
+    ``extend_to_core`` emits < 6,000 tokens of tool schemas (≥50% cut from
+    the ~11.7K o200k baseline, S205-ANATOMY.md §3).
+
+    The executor's real toolset is 18 core tools — all core, so the
+    MCP/plugin-only disclosure never fired for it (Tier 0 passthrough).
+    The budget is asserted with the codebase's own chars/4 estimator
+    (``tools.tool_search.estimate_tokens_from_schemas``), which the S205
+    anatomy measured ~7% ABOVE o200k (S205-ANATOMY.md §4) — passing that
+    stricter metric implies the design's < 6,000 o200k budget with margin.
+    """
+    from tools.registry import registry
+    from tools.tool_search import (
+        ToolSearchConfig, assemble_tool_defs, estimate_tokens_from_schemas,
+    )
+
+    executor_tools = [
+        "cronjob", "session_search", "delegate_task", "skill_manage", "terminal",
+        "memory", "execute_code", "clarify", "patch", "search_files",
+        "read_file", "todo", "process", "write_file", "web_extract",
+        "skill_view", "web_search", "skills_list",
+    ]
+    # Build the executor-shaped list from the registry's STATIC schemas
+    # (what ships on the wire when the tool is available), not the
+    # check_fn-filtered get_tool_definitions() result: the pytest sandbox
+    # (tests/conftest.py) unsets HERMES_INTERACTIVE / HERMES_GATEWAY_SESSION
+    # / HERMES_EXEC_ASK, so check_fn-gated tools (cronjob) are stripped
+    # regardless of the feature under test.
+    executor_defs = []
+    for name in executor_tools:
+        schema = registry.get_schema(name)
+        assert schema is not None, f"executor tool {name} missing from registry"
+        # get_schema returns the raw function schema (name/description/
+        # parameters) — wrap it in the OpenAI tool-def shape the registry
+        # ships on the wire (what get_definitions returns).
+        if schema.get("type") == "function":
+            executor_defs.append(schema)
+        else:
+            executor_defs.append({"type": "function", "function": schema})
+
+    baseline_tokens = estimate_tokens_from_schemas(executor_defs)
+    assembled = assemble_tool_defs(
+        executor_defs,
+        context_length=200_000,
+        config=ToolSearchConfig.from_raw({"enabled": "on", "extend_to_core": True}),
+    )
+    assert assembled.activated, "extend_to_core must activate the bridge"
+    names = {t["function"]["name"] for t in assembled.tool_defs}
+    assert {"cronjob", "session_search", "delegate_task",
+            "memory", "clarify", "todo"}.isdisjoint(names)
+
+    assembled_tokens = estimate_tokens_from_schemas(assembled.tool_defs)
+    # chars/4 runs ~7% above o200k → 6,400 here ≈ the design's <6,000 o200k.
+    assert assembled_tokens < 6400, (
+        f"tool schemas under extend_to_core = {assembled_tokens} est tokens "
+        f"(baseline {baseline_tokens}); expected < 6400 (≈<6000 o200k)"
+    )
+
+
 
 

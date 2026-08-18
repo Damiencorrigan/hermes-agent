@@ -616,3 +616,129 @@ class TestDeferredCallSchemaProbe:
         ))
         assert result.get("ok") is True
         assert result.get("doc") == "abc"
+
+
+# ---------------------------------------------------------------------------
+# Core deferral (opt-in) — S205 design: lazy/on-demand loading for core tools.
+# ---------------------------------------------------------------------------
+
+# The executor profile's real toolset (S205-ANATOMY.md §3): all 18 tools are
+# core, so the MCP/plugin-only bridge never fired for it (Tier 0 passthrough).
+EXECUTOR_TOOLS = [
+    "cronjob", "session_search", "delegate_task", "skill_manage", "terminal",
+    "memory", "execute_code", "clarify", "patch", "search_files",
+    "read_file", "todo", "process", "write_file", "web_extract",
+    "skill_view", "web_search", "skills_list",
+]
+
+# The curated deferrable-core set (S205-DESIGN.md §2, base tier).
+EXPECTED_DEFERRABLE_CORE = frozenset({
+    "cronjob", "session_search", "delegate_task", "memory", "clarify", "todo",
+})
+
+
+class TestCoreDeferral:
+    """S205 design: extend_to_core moves a curated subset of CORE tools
+    behind the existing tool_search / tool_describe / tool_call bridge.
+
+    Default (key unset) is byte-identical passthrough — see
+    test_default_config_keeps_all_core_tools_visible.
+    """
+
+    @staticmethod
+    def _executor_defs():
+        return [_td(name, f"Tool {name}.") for name in EXECUTOR_TOOLS]
+
+    def test_default_config_keeps_all_core_tools_visible(self):
+        """Byte-identical default: extend_to_core unset → pure passthrough,
+        no bridge tools injected, tool list unchanged."""
+        from tools.tool_search import assemble_tool_defs, ToolSearchConfig
+        defs = self._executor_defs()
+        result = assemble_tool_defs(
+            defs, context_length=200_000,
+            config=ToolSearchConfig.from_raw(None),
+        )
+        assert not result.activated
+        assert result.tool_defs == defs
+
+    def test_extend_to_core_defers_curated_core_tools(self):
+        """S205 design §5: with extend_to_core=True and an all-core tool
+        list (executor-shaped), the curated core tools are absent from the
+        visible array, bridge tools are present, and always-on core tools
+        remain visible."""
+        from tools.tool_search import (
+            assemble_tool_defs, ToolSearchConfig, BRIDGE_TOOL_NAMES,
+        )
+        defs = self._executor_defs()
+        result = assemble_tool_defs(
+            defs, context_length=200_000,
+            config=ToolSearchConfig.from_raw(
+                {"enabled": "on", "extend_to_core": True}
+            ),
+        )
+        assert result.activated
+        names = {t["function"]["name"] for t in result.tool_defs}
+        assert EXPECTED_DEFERRABLE_CORE.isdisjoint(names), (
+            f"curated core tools must be deferred, still visible: "
+            f"{sorted(EXPECTED_DEFERRABLE_CORE & names)}"
+        )
+        assert BRIDGE_TOOL_NAMES <= names, "bridge tools must be present"
+        assert set(EXECUTOR_TOOLS) - EXPECTED_DEFERRABLE_CORE <= names, (
+            "always-on core tools must remain visible"
+        )
+
+    def test_core_deferral_list_overrides_curated_set(self):
+        """core_deferral_list replaces the default curated set."""
+        from tools.tool_search import assemble_tool_defs, ToolSearchConfig
+        defs = self._executor_defs()
+        cfg = ToolSearchConfig.from_raw({
+            "enabled": "on",
+            "extend_to_core": True,
+            "core_deferral_list": ["skill_manage", "execute_code"],
+        })
+        result = assemble_tool_defs(defs, context_length=200_000, config=cfg)
+        assert result.activated
+        names = {t["function"]["name"] for t in result.tool_defs}
+        assert "skill_manage" not in names
+        assert "execute_code" not in names
+        # Default-curated tools stay visible when the override drops them.
+        assert "cronjob" in names
+        assert "session_search" in names
+
+    def test_tool_call_round_trip_dispatches_deferred_core_tool(self, monkeypatch):
+        """S205 design §5: with extend_to_core, tool_search discovers a
+        deferred core tool, tool_describe returns its schema, and tool_call
+        dispatches it — a real round-trip through handle_function_call."""
+        import json
+        import model_tools
+        from tools import tool_search
+
+        monkeypatch.setattr(
+            tool_search,
+            "load_config",
+            lambda: tool_search.ToolSearchConfig.from_raw(
+                {"enabled": "on", "extend_to_core": True}
+            ),
+        )
+        found = json.loads(model_tools.handle_function_call(
+            function_name="tool_search",
+            function_args={"query": "session_search"},
+        ))
+        hits = {h.get("name") for h in found.get("matches", [])}
+        assert "session_search" in hits, (
+            f"deferred core tool not discoverable via tool_search: {found}"
+        )
+
+        desc = json.loads(model_tools.handle_function_call(
+            function_name="tool_describe",
+            function_args={"name": "session_search"},
+        ))
+        assert desc.get("name") == "session_search", f"tool_describe failed: {desc}"
+
+        called = json.loads(model_tools.handle_function_call(
+            function_name="tool_call",
+            function_args={"name": "session_search", "arguments": {"query": "probe"}},
+        ))
+        blob = json.dumps(called)
+        assert "not a deferrable" not in blob
+        assert "not available in this session" not in blob
