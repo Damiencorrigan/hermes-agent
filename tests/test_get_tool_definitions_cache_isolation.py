@@ -108,3 +108,46 @@ class TestQuietModeCacheIsolation:
             assert [future.result(timeout=2) for future in futures] == [[], []]
 
         assert len(model_tools._tool_defs_cache) == model_tools._TOOL_DEFS_CACHE_MAX
+
+
+class TestConfigFingerprintInvalidation:
+    """The quiet_mode cache key includes the config file's mtime/size
+    fingerprint, so flipping ``tools.tool_search.extend_to_core`` in
+    config.yaml must invalidate the memoized tool list (S205 design §3.2)."""
+
+    def test_tool_search_config_flip_invalidates_cache(self, tmp_path, monkeypatch):
+        import os
+        import time
+
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+
+        cfg_path = home / "config.yaml"
+        cfg_path.write_text(
+            "tools:\n  tool_search:\n    enabled: on\n", encoding="utf-8"
+        )
+        before = model_tools.get_tool_definitions(quiet_mode=True)
+        assert len(model_tools._tool_defs_cache) == 1
+        names_before = {t["function"]["name"] for t in before}
+        # cronjob is check_fn-gated off in the pytest sandbox (conftest
+        # unsets HERMES_INTERACTIVE / GATEWAY_SESSION / EXEC_ASK) — assert on
+        # a curated deferrable-core tool that is reliably present here.
+        assert "todo" in names_before  # all-core passthrough (default)
+
+        # Flip extend_to_core on and guarantee a distinct fingerprint.
+        cfg_path.write_text(
+            "tools:\n  tool_search:\n    enabled: on\n    extend_to_core: true\n",
+            encoding="utf-8",
+        )
+        os.utime(cfg_path, (time.time() + 5, time.time() + 5))
+        after = model_tools.get_tool_definitions(quiet_mode=True)
+        assert len(model_tools._tool_defs_cache) == 2, (
+            "config flip must produce a new cache key, not a stale cache hit"
+        )
+        names_after = {t["function"]["name"] for t in after}
+        assert "todo" not in names_after, (
+            "extend_to_core must defer curated core tools on the fresh "
+            "assembly; cache served the pre-flip list"
+        )
+        assert "tool_search" in names_after
