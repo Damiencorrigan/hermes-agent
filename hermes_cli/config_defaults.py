@@ -528,6 +528,20 @@ DEFAULT_CONFIG = {
     # 100K chars ≈ 25–35K tokens across typical tokenisers.
     "file_read_max_chars": 100_000,
 
+    # Full-read size gate (bytes) for read_file, keyed on the file's ON-DISK
+    # size (not the amount requested). 0 (default) = unlimited/off, so no
+    # profile's behavior changes unless it sets this explicitly. When set
+    # positive, a read_file call against a file bigger than this is refused
+    # outright — not paginated — with guidance to extract via grep/jq
+    # instead. Distinct from file_read_max_chars above, which trims the
+    # RETURNED content gracefully; this refuses before any content is
+    # produced, for files so large that even one paginated page is the
+    # wrong tool. Added 2026-08-20 (rule 18 evidence: Scout ×39 context
+    # overflow 2026-08-19 on qwen3.8:27b's 65K window, root-caused to a
+    # read_file full read of tracker.json (~124KB) / task_queue.jsonl
+    # (~430KB)).
+    "file_max_read_bytes": 0,
+
     # Seconds to wait at agent-build time for in-flight MCP server discovery
     # to finish before the agent snapshots its tool list.  MCP discovery runs
     # in a background thread so a slow/dead server can't freeze startup; this
