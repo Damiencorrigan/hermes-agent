@@ -805,6 +805,123 @@ class TestByteLayerBinaryDetection:
         assert result.is_binary is True
 
 
+# =========================================================================
+# file_max_read_bytes gate (2026-08-20, rule 18 evidence: Scout x39 context
+# overflow 2026-08-19 traced to a read_file full read of tracker.json /
+# task_queue.jsonl on qwen3.8:27b's 65K window). Off by default (0).
+# =========================================================================
+
+class TestMaxReadBytesGate:
+    """read_file refuses a full read outright once file_max_read_bytes is
+    configured and the file's on-disk size exceeds it — off by default."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_cache(self, monkeypatch):
+        import tools.file_operations as file_operations
+        monkeypatch.setattr(file_operations, "_max_read_bytes_cached", None)
+        yield
+        monkeypatch.setattr(file_operations, "_max_read_bytes_cached", None)
+
+    @staticmethod
+    def _dispatch(file_size: int, content: str = "hello\n"):
+        import base64 as b64
+
+        def side_effect(command, **kwargs):
+            if command.startswith("if [ -f "):
+                return {"output": f"{file_size}\n", "returncode": 0}
+            if command.startswith("head -c") and "| base64" in command:
+                return {"output": b64.b64encode(content.encode()[:1000]).decode(), "returncode": 0}
+            if command.startswith("head -c") and "2>/dev/null" in command:
+                return {"output": content[:1000], "returncode": 0}
+            if command.startswith("sed -n"):
+                return {"output": content, "returncode": 0}
+            if command.startswith("wc -l"):
+                return {"output": "1\n", "returncode": 0}
+            return {"output": "", "returncode": 0}
+
+        return side_effect
+
+    def test_get_max_read_bytes_default_off(self, monkeypatch):
+        import tools.file_operations as file_operations
+        import hermes_cli.config as hermes_config
+        monkeypatch.setattr(hermes_config, "load_config", lambda: {})
+        assert file_operations._get_max_read_bytes() == 0
+
+    def test_get_max_read_bytes_reads_positive_config(self, monkeypatch):
+        import tools.file_operations as file_operations
+        import hermes_cli.config as hermes_config
+        monkeypatch.setattr(hermes_config, "load_config", lambda: {"file_max_read_bytes": 49152})
+        assert file_operations._get_max_read_bytes() == 49152
+
+    def test_get_max_read_bytes_ignores_non_positive(self, monkeypatch):
+        import tools.file_operations as file_operations
+        import hermes_cli.config as hermes_config
+        monkeypatch.setattr(hermes_config, "load_config", lambda: {"file_max_read_bytes": -5})
+        assert file_operations._get_max_read_bytes() == 0
+
+    def test_get_max_read_bytes_falls_back_on_config_error(self, monkeypatch):
+        import tools.file_operations as file_operations
+        import hermes_cli.config as hermes_config
+
+        def _raise():
+            raise RuntimeError("no config")
+
+        monkeypatch.setattr(hermes_config, "load_config", _raise)
+        assert file_operations._get_max_read_bytes() == 0
+
+    def test_get_max_read_bytes_caches_across_calls(self, monkeypatch):
+        """First call wins; a later config change is not picked up mid-process."""
+        import tools.file_operations as file_operations
+        import hermes_cli.config as hermes_config
+        monkeypatch.setattr(hermes_config, "load_config", lambda: {"file_max_read_bytes": 12345})
+        assert file_operations._get_max_read_bytes() == 12345
+        monkeypatch.setattr(hermes_config, "load_config", lambda: {"file_max_read_bytes": 99999})
+        assert file_operations._get_max_read_bytes() == 12345
+
+    def test_read_file_blocked_when_over_cap(self, mock_env, monkeypatch):
+        import hermes_cli.config as hermes_config
+        monkeypatch.setattr(hermes_config, "load_config", lambda: {"file_max_read_bytes": 49152})
+        mock_env.execute.side_effect = self._dispatch(file_size=131072)  # 128KB > 48KB cap
+        ops = ShellFileOperations(mock_env)
+        result = ops.read_file("/tmp/tracker.json")
+        assert result.error is not None
+        assert "full read forbidden" in result.error
+        assert "file_max_read_bytes=48KB" in result.error
+        assert "grep/jq" in result.error
+        assert result.content == ""
+        assert result.file_size == 131072
+
+    def test_read_file_allowed_when_under_cap(self, mock_env, monkeypatch):
+        import hermes_cli.config as hermes_config
+        monkeypatch.setattr(hermes_config, "load_config", lambda: {"file_max_read_bytes": 49152})
+        mock_env.execute.side_effect = self._dispatch(file_size=1024, content="small file\n")
+        ops = ShellFileOperations(mock_env)
+        result = ops.read_file("/tmp/small.txt")
+        assert result.error is None
+        assert "small file" in (result.content or "")
+
+    def test_read_file_unaffected_by_default_zero_cap(self, mock_env, monkeypatch):
+        """Off by default: a huge file still reads normally when the key is unset."""
+        import hermes_cli.config as hermes_config
+        monkeypatch.setattr(hermes_config, "load_config", lambda: {})
+        mock_env.execute.side_effect = self._dispatch(
+            file_size=999_999_999, content="big file content\n"
+        )
+        ops = ShellFileOperations(mock_env)
+        result = ops.read_file("/tmp/huge.jsonl")
+        assert result.error is None
+        assert "big file content" in (result.content or "")
+
+    def test_read_file_exactly_at_cap_is_allowed(self, mock_env, monkeypatch):
+        """The gate is a strict '>' — a file exactly at the cap still reads."""
+        import hermes_cli.config as hermes_config
+        monkeypatch.setattr(hermes_config, "load_config", lambda: {"file_max_read_bytes": 100})
+        mock_env.execute.side_effect = self._dispatch(file_size=100, content="exactly cap\n")
+        ops = ShellFileOperations(mock_env)
+        result = ops.read_file("/tmp/exact.txt")
+        assert result.error is None
+        assert "exactly cap" in (result.content or "")
+
 
 class TestEscapeNativeToolArg:
     """Regression tests for _escape_native_tool_arg (Windows native-binary paths).

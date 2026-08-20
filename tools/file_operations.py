@@ -800,6 +800,42 @@ DEFAULT_SEARCH_LIMIT = 50
 # `wc -c` prints only digits, so this can never collide with a real size.
 NOT_REGULAR_SENTINEL = "__hermes_not_regular__"
 
+# ---------------------------------------------------------------------------
+# Full-read size gate (bytes): config-driven hard refusal for read_file
+# against files whose on-disk size exceeds ``file_max_read_bytes``. Default 0
+# (unlimited/off) — profiles that never set this key see no behavior change.
+# Distinct from MAX_FILE_SIZE above (an unused legacy constant — the old
+# "if file_size > MAX_FILE_SIZE: pass" no-op this replaces) and from
+# tools/file_tools.py's file_read_max_chars (which trims the RETURNED
+# content gracefully with an offset continuation instead of refusing).
+# ---------------------------------------------------------------------------
+_max_read_bytes_cached: int | None = None
+
+
+def _get_max_read_bytes() -> int:
+    """Return the configured full-read size gate in bytes (0 = unlimited/off).
+
+    Reads ``file_max_read_bytes`` from config.yaml on first call, caches the
+    result for the lifetime of the process. Falls back to 0 (off) if config
+    is missing, invalid, or the key is unset — matching
+    ``tools.file_tools._get_max_read_chars``'s lazy-load + module-cache
+    pattern for the sibling read_file config knob.
+    """
+    global _max_read_bytes_cached
+    if _max_read_bytes_cached is not None:
+        return _max_read_bytes_cached
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        val = cfg.get("file_max_read_bytes")
+        if isinstance(val, (int, float)) and val > 0:
+            _max_read_bytes_cached = int(val)
+            return _max_read_bytes_cached
+    except Exception:
+        pass
+    _max_read_bytes_cached = 0
+    return _max_read_bytes_cached
+
 
 def _coerce_int(value: Any, default: int) -> int:
     """Best-effort integer coercion for tool pagination inputs."""
@@ -1398,11 +1434,6 @@ class ShellFileOperations(FileOperations):
         except ValueError:
             file_size = 0
         
-        # Check if file is too large
-        if file_size > MAX_FILE_SIZE:
-            # Still try to read, but warn
-            pass
-        
         # Images are never inlined — redirect to the vision tool
         if self._is_image(path):
             return ReadResult(
@@ -1433,7 +1464,29 @@ class ShellFileOperations(FileOperations):
                 file_size=file_size,
                 error=describe_binary_file(sample_bytes, file_size),
             )
-        
+
+        # Full-read size gate (2026-08-20, rule 18 evidence: Scout ×39
+        # context overflow 2026-08-19 on qwen3.8:27b's 65K window, root
+        # cause traced to a read_file full read of tracker.json/
+        # task_queue.jsonl). Config-driven and OFF by default
+        # (file_max_read_bytes=0) — refuses the read outright rather than
+        # silently paginating, so a profile that opts in gets a loud,
+        # recoverable tool error instead of a dead session. Distinct from
+        # file_read_max_chars (tools/file_tools.py), which trims the
+        # RETURNED content gracefully; this gate blocks the read before any
+        # content is produced, because for files this large even one
+        # paginated page is the wrong tool — grep/jq/python slicing is.
+        max_read_bytes = _get_max_read_bytes()
+        if max_read_bytes > 0 and file_size > max_read_bytes:
+            return ReadResult(
+                file_size=file_size,
+                error=(
+                    f"file '{path}' is {file_size // 1024}KB — full read "
+                    f"forbidden by file_max_read_bytes={max_read_bytes // 1024}KB; "
+                    "extract with grep/jq instead"
+                ),
+            )
+
         # Read with pagination using sed, clamping each line to a byte
         # budget IN THE SHELL so a pathological single-line file (e.g. one
         # 400MB minified line) never crosses the exec transport. The Python
