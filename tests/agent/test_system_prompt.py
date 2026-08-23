@@ -339,3 +339,78 @@ class TestSkillsInVolatileBand:
         full = _build(build_system_prompt)
         assert full.index(_CONTEXT) < full.index(_SKILLS)
         assert full.index(_SKILLS) < full.index("Conversation started:")
+
+
+_SOUL_IDENTITY = "## Identity\nYou are Hermes, a helpful assistant."
+
+
+def _soul_with_rules(ruling_text: str) -> str:
+    """A SOUL.md body carrying the sync-managed FLEET-RULES/DAMIEN-RULINGS
+    marker blocks that ops/soul_rules_sync.py and ops/rulings_soul_sync.py
+    periodically rewrite (see docs/level5-rulings-20260815.md in ai-fleet).
+    Only *ruling_text* differs between the two builds under test — this
+    models what a sync rewrite actually changes on disk.
+    """
+    return (
+        f"{_SOUL_IDENTITY}\n\n"
+        "<!-- FLEET-RULES-BEGIN -->\n"
+        f"Consolidated fleet rules. {ruling_text}\n"
+        "<!-- FLEET-RULES-END -->\n"
+    )
+
+
+class TestSoulSyncBlocksRenderLast:
+    """FLEET-RULES/DAMIEN-RULINGS/FLEET-STATE are sync-managed marker blocks
+    inside SOUL.md, rewritten out-of-band by ops/soul_rules_sync.py and
+    ops/rulings_soul_sync.py whenever a ruling or fleet-state fact changes —
+    not on every run. Left inline, they sit inside the very first
+    stable_parts entry, so a sync rewrite bursts the prompt-cache prefix for
+    every static guidance block concatenated after them. Extracting them and
+    re-appending after that guidance (system_prompt.py's
+    ``_split_soul_sync_blocks`` / the ``_soul_sync_tail`` append) keeps the
+    guidance ahead of them byte-identical across a sync rewrite."""
+
+    def _stable_for_ruling(self, ruling_text: str) -> str:
+        agent = _make_agent(_task_completion_guidance=True, valid_tool_names=["x"])
+        with (
+            patch("run_agent.load_soul_md", return_value=_soul_with_rules(ruling_text)),
+            patch("run_agent.build_nous_subscription_prompt", return_value=""),
+            patch("run_agent.build_environment_hints", return_value=""),
+            patch("run_agent.build_context_files_prompt", return_value=""),
+        ):
+            return build_system_prompt_parts(agent)["stable"]
+
+    def test_static_guidance_prefix_is_byte_identical_across_a_sync_rewrite(self):
+        stable_v1 = self._stable_for_ruling("RULE_V1_TEXT")
+        stable_v2 = self._stable_for_ruling("RULE_V2_TEXT_DIFFERENT_LENGTH_TOO")
+
+        # Locate each build's marker-block tail and strip it off.
+        marker = "<!-- FLEET-RULES-BEGIN -->"
+        prefix_v1 = stable_v1[: stable_v1.index(marker)]
+        prefix_v2 = stable_v2[: stable_v2.index(marker)]
+
+        # The prefix ahead of the marker block — SOUL identity text plus
+        # every static guidance block (TASK_COMPLETION_GUIDANCE etc.) — is
+        # byte-identical even though the ruling text inside the marker block
+        # changed and changed length.
+        assert prefix_v1 == prefix_v2
+        # Sanity: static guidance actually rendered into that shared prefix.
+        assert "Identity" in prefix_v1
+
+        # Each build still carries its own (volatile) ruling text, at the
+        # very end of the stable tier.
+        assert stable_v1.endswith(
+            "Consolidated fleet rules. RULE_V1_TEXT\n<!-- FLEET-RULES-END -->"
+        )
+        assert stable_v2.endswith(
+            "Consolidated fleet rules. RULE_V2_TEXT_DIFFERENT_LENGTH_TOO\n"
+            "<!-- FLEET-RULES-END -->"
+        )
+
+    def test_non_marker_soul_text_stays_in_place_ahead_of_static_guidance(self):
+        # Hand-written SOUL.md text outside the marker block (a profile's own
+        # persona notes) is not sync-managed and must not be relocated.
+        stable = self._stable_for_ruling("RULE_V1_TEXT")
+        assert stable.index(_SOUL_IDENTITY.split("\n")[1]) < stable.index(
+            "<!-- FLEET-RULES-BEGIN -->"
+        )

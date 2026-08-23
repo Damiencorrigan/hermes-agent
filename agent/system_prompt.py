@@ -60,6 +60,59 @@ _PLUGIN_SECTION_FRAME_RE = re.compile(
     re.MULTILINE,
 )
 
+# SOUL.md marker blocks rewritten periodically (every ~900s, only on real
+# content changes) by ~/.hermes/ops/soul_rules_sync.py (FLEET-RULES) and
+# ~/.hermes/ops/rulings_soul_sync.py (DAMIEN-RULINGS, FLEET-STATE). Left in
+# place, these blocks sit inside SOUL.md — the very first stable_parts entry
+# — so any sync-detected change busts the prompt-cache prefix for
+# EVERYTHING concatenated after them, including large static guidance
+# blocks (TASK_COMPLETION_GUIDANCE, MEMORY_GUIDANCE, coding guidance, etc.)
+# that never themselves change. Extracting the blocks here and letting the
+# caller re-append them after that static guidance means a sync change only
+# busts its own bytes plus the already session-variable context/volatile
+# tiers — never the static guidance that sits between SOUL.md and the
+# context tier today.
+#
+# This is a purely in-memory reordering of the assembled prompt string: the
+# SOUL.md file on disk is never touched. Both sync scripts locate their
+# block by scanning for the literal marker text (see ``find_markers`` in
+# ``rulings_soul_sync.py`` / ``soul_rules_sync.py``), not by line position,
+# so moving a block's rendered position here never fights their round-trip.
+_SOUL_SYNC_BLOCK_RE = re.compile(
+    r"<!-- (?P<tag>FLEET-RULES|DAMIEN-RULINGS|FLEET-STATE)-BEGIN -->"
+    r".*?"
+    r"<!-- (?P=tag)-END -->",
+    re.DOTALL,
+)
+
+
+def _split_soul_sync_blocks(content: str) -> tuple[str, str]:
+    """Pull sync-managed marker blocks out of loaded SOUL.md content.
+
+    Returns ``(remainder, sync_tail)``: *remainder* is *content* with every
+    FLEET-RULES/DAMIEN-RULINGS/FLEET-STATE block removed (hand-written text
+    around/between the blocks — e.g. a profile's own persona notes — is left
+    untouched, in its original position); *sync_tail* is the extracted
+    blocks joined in their original relative order, ready to be appended
+    after the rest of the stable tier. Either half can be empty (no markers
+    found -> ``(content, "")``).
+    """
+    blocks: List[str] = []
+
+    def _capture(match: "re.Match[str]") -> str:
+        blocks.append(match.group(0))
+        return ""
+
+    if not content or "-BEGIN -->" not in content:
+        return content, ""
+    remainder = _SOUL_SYNC_BLOCK_RE.sub(_capture, content)
+    if not blocks:
+        return content, ""
+    # Collapse blank-line runs left behind by the removal so the remainder
+    # doesn't accumulate stray whitespace where a block used to sit.
+    remainder = re.sub(r"\n{3,}", "\n\n", remainder).strip()
+    return remainder, "\n\n".join(blocks)
+
 
 def _ra():
     """Lazy reference to the ``run_agent`` module.
@@ -303,9 +356,11 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # Some execution modes (cron) still want HERMES_HOME persona while keeping
     # cwd project instructions disabled.
     _soul_loaded = False
+    _soul_sync_tail = ""
     if agent.load_soul_identity or not agent.skip_context_files:
         _soul_content = _r.load_soul_md(_ctx_len)
         if _soul_content:
+            _soul_content, _soul_sync_tail = _split_soul_sync_blocks(_soul_content)
             stable_parts.append(_soul_content)
             _soul_loaded = True
 
@@ -584,6 +639,15 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         _effective_hint = _tui_embedded_pane_clarifier(_effective_hint)
     if _effective_hint:
         post_workspace_parts.append(_effective_hint)
+
+    # SOUL.md's sync-managed marker blocks (FLEET-RULES / DAMIEN-RULINGS /
+    # FLEET-STATE — see _split_soul_sync_blocks above) render last in the
+    # stable tier, after every static guidance block built above. A sync
+    # rewrite therefore only busts its own bytes plus the context/volatile
+    # tiers that follow — never the static guidance that used to sit
+    # downstream of these blocks when they lived inline inside SOUL.md.
+    if _soul_sync_tail:
+        stable_parts.append(_soul_sync_tail)
 
     # ── Context tier (cwd-dependent, may change between sessions) ─
     context_parts: List[str] = []
