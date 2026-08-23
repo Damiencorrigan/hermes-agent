@@ -29,6 +29,7 @@ from typing import Any, Dict, Optional
 
 from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
+from agent.dgx_sglang_budget import enforce_dgx_sglang_token_budget
 from agent.error_classifier import FailoverReason
 from agent.errors import EmptyStreamError
 from agent.cost_mode import (
@@ -1547,7 +1548,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         # registered providers with profiles were bypassing the strip.
         api_messages = agent._prepare_messages_for_non_vision_model(api_messages)
 
-        return _ct.build_kwargs(
+        _api_kwargs = _ct.build_kwargs(
             model=agent.model,
             messages=api_messages,
             tools=tools_for_api,
@@ -1568,6 +1569,11 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             supports_reasoning=agent._supports_reasoning_extra_body(),
             qwen_session_metadata=_qwen_meta,
         )
+        # Last-resort hard token-budget clamp (2026-08-23, HTTP 400 "input
+        # longer than context length"). No-op for every route except the
+        # dgx-sglang canary; runs after compression has already had its
+        # chance to shrink this request.
+        return enforce_dgx_sglang_token_budget(agent, _api_kwargs)
 
     # ── Legacy flag path ────────────────────────────────────────────
     # Reached only when get_provider_profile() returns None — i.e. a
@@ -1579,7 +1585,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
     # Strip image parts for non-vision models (no-op when vision-capable).
     _msgs_for_chat = agent._prepare_messages_for_non_vision_model(api_messages)
 
-    return _ct.build_kwargs(
+    _api_kwargs = _ct.build_kwargs(
         model=agent.model,
         messages=_msgs_for_chat,
         tools=tools_for_api,
@@ -1615,6 +1621,11 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         anthropic_max_output=_ant_max,
         provider_name=agent.provider,
     )
+    # Last-resort hard token-budget clamp (2026-08-23, HTTP 400 "input
+    # longer than context length"). No-op for every route except the
+    # dgx-sglang canary; runs after compression has already had its chance
+    # to shrink this request.
+    return enforce_dgx_sglang_token_budget(agent, _api_kwargs)
 
 
 
