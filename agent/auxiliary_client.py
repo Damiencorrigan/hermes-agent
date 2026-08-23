@@ -161,6 +161,7 @@ def aux_probe_mode():
         _aux_probe_state.active = prev
 
 from agent.credential_pool import load_pool
+from agent.dgx_sglang_budget import enforce_dgx_sglang_token_budget_raw
 from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, get_model_context_length
 from hermes_cli.config import get_hermes_home
 from hermes_constants import OPENROUTER_BASE_URL
@@ -8464,6 +8465,17 @@ def _build_call_kwargs(
             or _is_anthropic_compat_endpoint(provider_norm, effective_base)
         ):
             kwargs["_reasoning_config"] = dict(reasoning_config)
+
+    # Last-resort hard token-budget clamp (2026-08-23). This is the single
+    # shared kwargs-builder behind every auxiliary/retry/fallback send in
+    # this module (context-compression's own summarization call, vision,
+    # session search, same-provider retry, cross-provider fallback — sync
+    # and async all funnel through here before .create()), so patching it
+    # once covers all of them. No-op for every route except the dgx-sglang
+    # canary.
+    kwargs = enforce_dgx_sglang_token_budget_raw(
+        provider=provider, base_url=base_url, model=model, api_kwargs=kwargs,
+    )
 
     return kwargs
 

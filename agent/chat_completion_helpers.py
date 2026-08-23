@@ -2619,6 +2619,13 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 summary_client = agent._ensure_primary_openai_client(
                     reason="iteration_limit_summary"
                 )
+                # Last-resort hard token-budget clamp (2026-08-23). This
+                # call bypasses build_api_kwargs entirely (calls
+                # chat.completions.create() directly) and fires exactly when
+                # history is largest — the iteration-limit summary is asked
+                # to summarize the whole oversized conversation. No-op for
+                # every route except the dgx-sglang canary.
+                summary_kwargs = enforce_dgx_sglang_token_budget(agent, summary_kwargs)
                 summary_response = _managed_summary_call(
                     summary_kwargs,
                     lambda request: summary_client.chat.completions.create(**request),
@@ -2681,6 +2688,10 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 summary_client = agent._ensure_primary_openai_client(
                     reason="iteration_limit_summary_retry"
                 )
+                # Same last-resort clamp as the initial summary attempt
+                # above — the retry rebuilds summary_kwargs fresh, so it
+                # needs its own pass.
+                summary_kwargs = enforce_dgx_sglang_token_budget(agent, summary_kwargs)
                 summary_response = _managed_summary_call(
                     summary_kwargs,
                     lambda request: summary_client.chat.completions.create(**request),
