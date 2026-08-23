@@ -74,40 +74,76 @@ _PLUGIN_SECTION_FRAME_RE = re.compile(
 # context tier today.
 #
 # This is a purely in-memory reordering of the assembled prompt string: the
-# SOUL.md file on disk is never touched. Both sync scripts locate their
-# block by scanning for the literal marker text (see ``find_markers`` in
-# ``rulings_soul_sync.py`` / ``soul_rules_sync.py``), not by line position,
-# so moving a block's rendered position here never fights their round-trip.
-_SOUL_SYNC_BLOCK_RE = re.compile(
-    r"<!-- (?P<tag>FLEET-RULES|DAMIEN-RULINGS|FLEET-STATE)-BEGIN -->"
-    r".*?"
-    r"<!-- (?P=tag)-END -->",
-    re.DOTALL,
-)
+# SOUL.md file on disk is never touched.
+#
+# Marker-pairing semantics deliberately mirror ``find_markers`` in
+# ``~/.hermes/ops/soul_rules_sync.py`` / ``~/.hermes/ops/rulings_soul_sync.py``
+# (first BEGIN line, first END line of the SAME marker pair after it, an
+# exact-line match after stripping whitespace) rather than importing either
+# module: ``~/.hermes`` is a separate runtime/ops checkout, not a dependency
+# of this package — it is this operator's personal ops tree, won't exist on
+# another install or in CI, and isn't on ``sys.path`` for this repo. A hard
+# import would make prompt assembly depend on a directory structure outside
+# hermes-agent's own contract. Keeping the matching rule identical (rather
+# than the earlier, looser "marker text anywhere in a DOTALL regex" version)
+# is what actually avoids drift: any file both sync scripts consider
+# well-formed parses identically here, and a malformed/unterminated block
+# fails open — the affected text is left in place, inline, exactly like
+# before this change, rather than guessing at a boundary.
+_SOUL_SYNC_MARKER_TAGS = ("FLEET-RULES", "DAMIEN-RULINGS", "FLEET-STATE")
+
+
+def _soul_sync_marker_line(line: str, tag: str, suffix: str) -> bool:
+    return line.strip() == f"<!-- {tag}-{suffix} -->"
 
 
 def _split_soul_sync_blocks(content: str) -> tuple[str, str]:
     """Pull sync-managed marker blocks out of loaded SOUL.md content.
 
     Returns ``(remainder, sync_tail)``: *remainder* is *content* with every
-    FLEET-RULES/DAMIEN-RULINGS/FLEET-STATE block removed (hand-written text
-    around/between the blocks — e.g. a profile's own persona notes — is left
-    untouched, in its original position); *sync_tail* is the extracted
-    blocks joined in their original relative order, ready to be appended
-    after the rest of the stable tier. Either half can be empty (no markers
-    found -> ``(content, "")``).
+    well-formed FLEET-RULES/DAMIEN-RULINGS/FLEET-STATE block removed
+    (hand-written text around/between the blocks — e.g. a profile's own
+    persona notes — is left untouched, in its original position);
+    *sync_tail* is the extracted blocks joined in their original relative
+    order, ready to be appended after the rest of the stable tier. Either
+    half can be empty (no markers found -> ``(content, "")``).
     """
-    blocks: List[str] = []
-
-    def _capture(match: "re.Match[str]") -> str:
-        blocks.append(match.group(0))
-        return ""
-
     if not content or "-BEGIN -->" not in content:
         return content, ""
-    remainder = _SOUL_SYNC_BLOCK_RE.sub(_capture, content)
-    if not blocks:
+
+    lines = content.split("\n")
+    n = len(lines)
+    spans: List[tuple] = []  # [(start_idx, end_idx_inclusive), ...] in order
+    i = 0
+    while i < n:
+        tag = next(
+            (t for t in _SOUL_SYNC_MARKER_TAGS if _soul_sync_marker_line(lines[i], t, "BEGIN")),
+            None,
+        )
+        if tag is None:
+            i += 1
+            continue
+        end_idx = next(
+            (j for j in range(i + 1, n) if _soul_sync_marker_line(lines[j], tag, "END")),
+            None,
+        )
+        if end_idx is None:
+            # Unterminated marker — fail open (leave in place) rather than
+            # guess at a boundary; a damaged block is the sync scripts' own
+            # repair case, not something to paper over here.
+            i += 1
+            continue
+        spans.append((i, end_idx))
+        i = end_idx + 1
+
+    if not spans:
         return content, ""
+
+    blocks = ["\n".join(lines[start : end + 1]) for start, end in spans]
+    remainder_lines = list(lines)
+    for start, end in reversed(spans):
+        del remainder_lines[start : end + 1]
+    remainder = "\n".join(remainder_lines)
     # Collapse blank-line runs left behind by the removal so the remainder
     # doesn't accumulate stray whitespace where a block used to sit.
     remainder = re.sub(r"\n{3,}", "\n\n", remainder).strip()
@@ -552,12 +588,25 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # entirely for remote terminal backends (the host's Python state is
     # irrelevant when tools run inside docker/modal/ssh).  Gated by
     # config.yaml ``agent.environment_probe`` (default True).
+    #
+    # Always collected into its own list and rendered in the CONTEXT tier,
+    # never into stable_parts/post_workspace_parts: unlike the active-profile
+    # and platform hints below (deterministic for a given agent config, so
+    # legitimately stable across repeat runs of the same recurring cron
+    # agent), this line reflects the host's live Python/pip/PEP-668 state at
+    # process start, which can genuinely differ run to run. Left in the
+    # no-coding-workspace branch's old aliased post_workspace_parts (which
+    # folds into stable_parts — see above), it would sit inside the emitted
+    # "stable" prefix ahead of the relocated SOUL.md sync tail, so a
+    # coincidental env change would bust that whole prefix even though
+    # nothing about the agent's identity/rules changed. See PR #10 review.
+    _env_probe_parts: List[str] = []
     if getattr(agent, "_environment_probe", True):
         try:
             from tools.env_probe import get_environment_probe_line
             _probe_line = get_environment_probe_line()
             if _probe_line:
-                post_workspace_parts.append(_probe_line)
+                _env_probe_parts.append(_probe_line)
         except Exception:
             # Probe failure must never block prompt build.
             pass
@@ -655,7 +704,20 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if coding_workspace_parts:
         context_parts.extend(coding_workspace_parts)
         context_parts.extend(coding_trailing_parts)
+        # _env_probe_parts renders in the same relative position it held
+        # before this change (right after the coding tail, ahead of the
+        # profile/platform hints) — only its tier changed for the
+        # no-coding-workspace branch below, not its position relative to
+        # the coding-workspace content.
+        context_parts.extend(_env_probe_parts)
         context_parts.extend(post_workspace_parts)
+    else:
+        # No coding-workspace snapshot: post_workspace_parts is aliased
+        # into stable_parts above (profile/platform hints are deterministic
+        # per agent config, so legitimately stable across repeat runs).
+        # _env_probe_parts is never aliased — it always renders here,
+        # keeping the live env-probe line out of the stable prefix.
+        context_parts.extend(_env_probe_parts)
 
     # Note: ephemeral_system_prompt is NOT included here. It's injected at
     # API-call time only so it stays out of the cached/stored system prompt.
