@@ -301,6 +301,7 @@ class InProcessCronScheduler(CronScheduler):
         ``web_server.py`` scopes per-profile cron API calls.
         """
         import logging
+        import time as _time
         from cron.scheduler import tick as cron_tick
         from cron.jobs import (
             clear_ticker_error,
@@ -316,6 +317,29 @@ class InProcessCronScheduler(CronScheduler):
             len(profile_homes),
             [p[0] if isinstance(p, tuple) else p for p in profile_homes],
         )
+
+        # Per-profile stall diagnostic (2026-08-24, cron ticker freeze
+        # follow-up): the outer `while` loop below writes the liveness
+        # heartbeat for EVERY profile only after the WHOLE inner
+        # `for entry in profile_homes` pass (recover_interrupted() +
+        # cron_tick() per profile, serial) completes. Observed live: the
+        # ticker completed exactly one full outer-loop pass after a restart
+        # (dispatching and clearing a large backlog across all profiles,
+        # confirmed via fresh claimed_at/completed rows in each profile's
+        # executions.db), then never started a second pass — heartbeat and
+        # jobs.json froze again with NO dead-owner debris left anywhere
+        # (recover_interrupted() benchmarked <30ms per profile in
+        # isolation) and NO 'running' row left in any multiplexed profile's
+        # ledger. The stall is therefore inside this inner loop's control
+        # flow itself on a later pass, not in job content or in the
+        # per-tick reconciliation added for #60432. No stack trace was
+        # obtainable (py-spy needs sudo, not available; SIGUSR2's
+        # faulthandler.register(chain=True) terminated the process instead
+        # of dumping — do not repeat that on a live gateway). This
+        # threshold log is the next-cheapest signal: it names the exact
+        # profile whose recover_interrupted()+cron_tick() call is slow/
+        # hung on whichever pass it happens on, without needing a debugger.
+        _STALL_WARN_SECONDS = 5.0
 
         # Recovery + initial heartbeat for every profile.
         for entry in profile_homes:
@@ -334,7 +358,11 @@ class InProcessCronScheduler(CronScheduler):
             finally:
                 reset_hermes_home_override(home_token)
 
+        _pass_num = 0
         while not stop_event.is_set():
+            _pass_num += 1
+            _pass_t0 = _time.monotonic()
+            logger.debug("Multiplex tick: starting outer pass #%d", _pass_num)
             ok = False
             try:
                 if can_dispatch is not None and not can_dispatch():
@@ -342,6 +370,7 @@ class InProcessCronScheduler(CronScheduler):
                 else:
                     for entry in profile_homes:
                         home = entry[1] if isinstance(entry, tuple) else entry
+                        _profile_t0 = _time.monotonic()
                         home_token = set_hermes_home_override(str(home))
                         try:
                             with use_cron_store(home):
@@ -381,12 +410,36 @@ class InProcessCronScheduler(CronScheduler):
                                 )
                         finally:
                             reset_hermes_home_override(home_token)
+                            _profile_dt = _time.monotonic() - _profile_t0
+                            if _profile_dt > _STALL_WARN_SECONDS:
+                                logger.warning(
+                                    "Multiplex tick: profile at %s took %.1fs "
+                                    "(recover_interrupted+cron_tick combined) "
+                                    "-- exceeds %.0fs stall threshold; this is "
+                                    "the profile holding up every OTHER "
+                                    "multiplexed profile's next heartbeat "
+                                    "until this pass finishes",
+                                    home, _profile_dt, _STALL_WARN_SECONDS,
+                                )
                 ok = True
             except BaseException as e:
                 logger.error("Cron tick error: %s", e, exc_info=True)
                 _tick_error = f"{type(e).__name__}: {e}"
             else:
                 _tick_error = None
+            _pass_dt = _time.monotonic() - _pass_t0
+            logger.debug(
+                "Multiplex tick: outer pass #%d finished in %.1fs (ok=%s)",
+                _pass_num, _pass_dt, ok,
+            )
+            if _pass_dt > _STALL_WARN_SECONDS * 2:
+                logger.warning(
+                    "Multiplex tick: outer pass #%d took %.1fs across all %d "
+                    "profile(s) -- every profile's heartbeat is delayed by "
+                    "this whole pass, so a slow pass here reads externally "
+                    "as ALL profiles being stalled at once",
+                    _pass_num, _pass_dt, len(profile_homes),
+                )
             # Record per-profile heartbeat after each tick cycle.
             for entry in profile_homes:
                 home = entry[1] if isinstance(entry, tuple) else entry
