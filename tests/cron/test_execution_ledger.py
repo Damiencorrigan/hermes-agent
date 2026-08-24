@@ -397,3 +397,116 @@ def test_job_listing_exposes_latest_execution(monkeypatch, tmp_path):
     listed = jobs.list_jobs(include_disabled=True)
     assert listed[0]["latest_execution"]["id"] == record["id"]
     assert listed[0]["latest_execution"]["status"] == "running"
+
+
+class TestExecutionsFileMultiplexScoping:
+    """Root-caused 2026-08-24 investigating a live ticker freeze: EXECUTIONS_FILE
+    was a plain module-level constant computed ONCE at import time from
+    get_hermes_home(), with no use_cron_store()/set_hermes_home_override()
+    awareness at all -- unlike jobs.json (cron.jobs._current_cron_store()).
+
+    Effect under a multiplexed gateway (scheduler_provider._start_multiplex
+    scopes each profile's tick via use_cron_store(profile_home)): every
+    create_execution()/recover_interrupted_executions() call during a
+    profile-scoped tick silently wrote to the DEFAULT/root profile's
+    executions.db instead of the calling profile's own -- so a profile's
+    dead-owner claimed/running rows could never be seen or reconciled by the
+    per-tick recovery pass (#60432 follow-up), even though that pass ran
+    without error every tick. Found via commander/trove/tva each carrying
+    real dead-pid rows in their OWN executions.db that recover_interrupted()
+    never touched.
+    """
+
+    def test_create_execution_scoped_to_use_cron_store_home(self, tmp_path):
+        import cron.executions as executions
+        import cron.jobs as jobs
+
+        default_home = tmp_path / "default"
+        profile_home = tmp_path / "profiles" / "commander"
+        default_home.mkdir(parents=True)
+        profile_home.mkdir(parents=True)
+
+        with jobs.use_cron_store(profile_home):
+            record = executions.create_execution("job-scoped", source="builtin")
+
+        # The profile's OWN ledger carries the row.
+        with jobs.use_cron_store(profile_home):
+            rows = executions.list_executions(job_id="job-scoped")
+        assert len(rows) == 1
+        assert rows[0]["id"] == record["id"]
+
+        # The default store was never touched -- no orphaned phantom entry,
+        # exactly the corruption the pre-fix behavior produced.
+        with jobs.use_cron_store(default_home):
+            assert executions.list_executions(job_id="job-scoped") == []
+
+    def test_recover_interrupted_executions_scoped_to_use_cron_store_home(
+        self, tmp_path, monkeypatch
+    ):
+        """The per-tick dead-pid reconciliation (InProcessCronScheduler.
+        recover_interrupted -> recover_interrupted_executions) must clean the
+        CALLING profile's own ledger, not silently no-op against an unrelated
+        (already-clean) default store."""
+        import cron.executions as executions
+        import cron.jobs as jobs
+
+        default_home = tmp_path / "default"
+        profile_home = tmp_path / "profiles" / "trove"
+        default_home.mkdir(parents=True)
+        profile_home.mkdir(parents=True)
+
+        with jobs.use_cron_store(profile_home):
+            record = executions.create_execution("job-dead", source="builtin")
+            # Simulate a dead owner from a DIFFERENT process generation: a
+            # different process_id (recover_interrupted_executions() skips
+            # rows matching this module instance's own _PROCESS_ID as "not
+            # abandoned, that's me") and a pid/start-time pair that can never
+            # match anything alive (pid 1 with a start time no live pid=1
+            # process on this host will ever report).
+            with executions._transaction() as conn:
+                conn.execute(
+                    "UPDATE executions SET process_id=?, pid=1, "
+                    "process_started_at=1 WHERE id=?",
+                    ("a-different-dead-process-id", record["id"]),
+                )
+
+            recovered = executions.recover_interrupted_executions()
+            assert recovered == 1
+
+            updated = executions.list_executions(job_id="job-dead")[0]
+            assert updated["status"] == "unknown"
+
+        # Never touched the default store.
+        with jobs.use_cron_store(default_home):
+            assert executions.list_executions(job_id="job-dead") == []
+
+    def test_reverts_to_default_after_use_cron_store_exits(self, tmp_path):
+        import cron.executions as executions
+        import cron.jobs as jobs
+
+        profile_home = tmp_path / "profiles" / "scoped"
+        profile_home.mkdir(parents=True)
+
+        before = executions._resolve_executions_file()
+        with jobs.use_cron_store(profile_home):
+            assert executions._resolve_executions_file() == (
+                profile_home.resolve() / "cron" / "executions.db"
+            )
+        after = executions._resolve_executions_file()
+        assert after == before
+
+    def test_monkeypatched_executions_file_still_honored_with_no_override(
+        self, monkeypatch, tmp_path
+    ):
+        """Backward compatibility: the documented test/embedder surface of
+        directly re-pointing executions.EXECUTIONS_FILE (no use_cron_store()
+        active) must keep working exactly as before this fix."""
+        import cron.executions as executions
+
+        custom = tmp_path / "custom" / "executions.db"
+        monkeypatch.setattr(executions, "EXECUTIONS_FILE", custom)
+
+        assert executions._resolve_executions_file() == custom
+        record = executions.create_execution("job-compat", source="builtin")
+        assert custom.exists()
+        assert executions.list_executions(job_id="job-compat")[0]["id"] == record["id"]

@@ -12,21 +12,79 @@ import sqlite3
 import threading
 import uuid
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
 from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
 
+# Import-time snapshot. Kept as a plain module attribute (not a function) so
+# the documented compatibility surface tests already rely on --
+# ``monkeypatch.setattr(executions, "EXECUTIONS_FILE", tmp_path / ...)`` --
+# keeps working unchanged: a caller that deliberately re-points this constant
+# is honored exactly as before this fix.
 EXECUTIONS_FILE = get_hermes_home().resolve() / "cron" / "executions.db"
+_IMPORT_EXECUTIONS_FILE = EXECUTIONS_FILE
 MAX_TERMINAL_EXECUTIONS = 1000
 _TERMINAL_STATES = ("completed", "failed", "unknown")
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
 
 
+def _resolve_executions_file() -> Path:
+    """Resolve the active execution ledger path for this call.
+
+    ``EXECUTIONS_FILE`` used to be read ONCE at import time and never
+    revisited. Every function in this module (``create_execution``,
+    ``recover_interrupted_executions``, ``finish_execution``, ...) always
+    wrote/read that single frozen path -- even while
+    ``cron.jobs.use_cron_store()`` / ``set_hermes_home_override()`` had a
+    DIFFERENT profile's store active on the calling thread (exactly the
+    scope ``scheduler_provider._start_multiplex`` sets up per profile, and
+    the same scope ``mark_running_jobs_interrupted`` now applies for
+    ``cron.jobs`` -- see #60432 and its follow-up above in cron/scheduler.py).
+
+    Practical effect of the bug: under a multiplexed gateway, EVERY
+    profile's ``create_execution``/``recover_interrupted_executions`` call
+    silently landed in the DEFAULT/root profile's executions.db, never the
+    calling profile's own. Root-caused 2026-08-24 investigating a live
+    ticker freeze: ``commander``/``trove``/``tva`` each carried real
+    dead-owner ``claimed``/``running`` rows in their OWN executions.db that
+    the per-tick ``recover_interrupted()`` reconciliation (added for the
+    #60432 follow-up) could never see or clean, because it was always
+    querying the wrong (already-clean) default store.
+
+    Precedence mirrors ``cron.jobs._current_cron_store()`` exactly, so
+    ``use_cron_store()`` scopes the execution ledger together with
+    jobs.json rather than the two drifting apart:
+
+    1. an active ``cron.jobs.use_cron_store()`` override (same ContextVar
+       cron/jobs.py uses -- read lazily here to avoid a cron.jobs<->
+       cron.executions import cycle at module load time);
+    2. ``EXECUTIONS_FILE`` re-pointed directly (the documented
+       compatibility surface tests/embedders use -- unchanged behavior);
+    3. the active profile home, resolved fresh via ``get_hermes_home()``
+       (context-local override, then ``HERMES_HOME``);
+    4. the import-time constant (home unchanged since import -- the common
+       single-profile path, returned unchanged).
+    """
+    from cron.jobs import _cron_store_override
+
+    override = _cron_store_override.get()
+    if override is not None:
+        return override.cron_dir / "executions.db"
+    if EXECUTIONS_FILE != _IMPORT_EXECUTIONS_FILE:
+        return EXECUTIONS_FILE
+    home = get_hermes_home().resolve()
+    if home == _IMPORT_EXECUTIONS_FILE.parent.parent:
+        return EXECUTIONS_FILE
+    return home / "cron" / "executions.db"
+
+
 def _connect() -> sqlite3.Connection:
-    EXECUTIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    return sqlite3.connect(EXECUTIONS_FILE, timeout=5)
+    path = _resolve_executions_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return sqlite3.connect(path, timeout=5)
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:
