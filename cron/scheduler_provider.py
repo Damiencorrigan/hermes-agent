@@ -238,6 +238,18 @@ class InProcessCronScheduler(CronScheduler):
                 if can_dispatch is not None and not can_dispatch():
                     logger.debug("Cron dispatch paused while gateway drains existing work")
                 else:
+                    # Per-tick dead-pid reconciliation (defense, 2026-08-24
+                    # follow-up to #60432) — see the matching call in
+                    # _start_multiplex for the full rationale. Mirrored here
+                    # so the single-profile path gets the same protection,
+                    # not just multiplexed gateways.
+                    recovered = self.recover_interrupted()
+                    if recovered:
+                        logger.warning(
+                            "Per-tick recovery: marked %d abandoned cron "
+                            "execution(s) unknown",
+                            recovered,
+                        )
                     cron_tick(
                         verbose=False,
                         adapters=adapters,
@@ -333,6 +345,33 @@ class InProcessCronScheduler(CronScheduler):
                         home_token = set_hermes_home_override(str(home))
                         try:
                             with use_cron_store(home):
+                                # Per-tick dead-pid reconciliation (defense,
+                                # 2026-08-24 follow-up to #60432): previously
+                                # this ran ONCE per profile at ticker startup
+                                # only (the loop above, before this while
+                                # loop). A 'claimed'/'running' execution row
+                                # whose owning pid died between startup and
+                                # now — e.g. the shutdown-scoping bug this
+                                # follow-up fixes left one such row wedged
+                                # for 7.5h with no gateway restart to trigger
+                                # a fresh recovery pass — went unreconciled
+                                # for the rest of this process's life.
+                                # recover_interrupted() only rewrites rows it
+                                # can PROVE are abandoned (dead pid, or a live
+                                # pid whose start time no longer matches —
+                                # see cron.executions._owner_is_live), so
+                                # running it every tick is safe: a live,
+                                # legitimately still-running job is left
+                                # untouched.
+                                recovered = self.recover_interrupted()
+                                if recovered:
+                                    logger.warning(
+                                        "Per-tick recovery: marked %d "
+                                        "abandoned cron execution(s) unknown "
+                                        "for profile at %s",
+                                        recovered,
+                                        home,
+                                    )
                                 cron_tick(
                                     verbose=False,
                                     adapters=adapters,

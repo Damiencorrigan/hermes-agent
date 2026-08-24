@@ -2135,10 +2135,10 @@ def clear_drift_alerted(job_id: str) -> None:
 
 def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                  delivery_error: Optional[str] = None,
-                 status: Optional[str] = None):
+                 status: Optional[str] = None) -> bool:
     """
     Mark a job as having been run.
-    
+
     Updates last_run_at, last_status, increments completed count,
     computes next_run_at, and auto-deletes if repeat limit reached.
 
@@ -2150,6 +2150,13 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
     the pre-dispatch configuration validation refused to run the agent
     (T1-26), so `cronjob list` distinguishes "your config is broken" from
     "the run itself failed".
+
+    Returns True if ``job_id`` was found (and the store's ``jobs.json`` was
+    updated), False if no job in the ACTIVE store (see
+    ``_current_cron_store()``) matched — e.g. the caller scoped to the
+    wrong profile. Pre-existing callers all discard the return value
+    (previously implicit ``None`` either way), so adding this is additive —
+    ``None``/``False`` are both falsy and no caller branches on it today.
     """
     with _jobs_lock():
         jobs = load_jobs()
@@ -2214,7 +2221,7 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                         job["state"] = "completed"
                         job["next_run_at"] = None
                         save_jobs(jobs)
-                        return
+                        return True
                 
                 # Compute next run
                 job["next_run_at"] = compute_next_run(job["schedule"], now)
@@ -2249,9 +2256,10 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                     job["state"] = "scheduled"
 
                 save_jobs(jobs)
-                return
+                return True
 
         logger.warning("mark_job_run: job_id %s not found, skipping save", job_id)
+        return False
 
 
 def _write_wedged_oneshot_diagnostic(job: Dict[str, Any]) -> None:

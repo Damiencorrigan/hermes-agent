@@ -23,9 +23,11 @@ def _reset_scheduler_state():
     import cron.scheduler as sched
 
     sched._running_job_ids.clear()
+    sched._running_job_homes.clear()
     sched._interrupted_job_ids.clear()
     yield
     sched._running_job_ids.clear()
+    sched._running_job_homes.clear()
     sched._interrupted_job_ids.clear()
 
 
@@ -247,3 +249,175 @@ class TestRunOneJobHonoursInterruptedFlag:
 
         assert result is False
         mock_mark.assert_not_called()
+
+
+class TestRunningJobHomeTracking:
+    """#60432 follow-up (2026-08-24): try_register_running_job snapshots the
+    ACTIVE profile home (the same one a normal tick scopes itself to via
+    set_hermes_home_override()/use_cron_store() -- see
+    scheduler_provider._start_multiplex) so a later, separate-thread
+    interrupt-mark can route back to the right store."""
+
+    def test_captures_active_home_on_register(self, tmp_path):
+        import cron.scheduler as sched
+        import hermes_constants
+
+        home = tmp_path / "profiles" / "trove"
+        home.mkdir(parents=True)
+
+        token = hermes_constants.set_hermes_home_override(str(home))
+        try:
+            assert sched.try_register_running_job("job-x") is True
+        finally:
+            hermes_constants.reset_hermes_home_override(token)
+
+        assert sched._running_job_homes["job-x"] == str(home.resolve())
+
+    def test_captures_ambient_home_when_no_override_active(self, tmp_path, monkeypatch):
+        """Single-profile gateway (no multiplex override): still captures
+        SOMETHING sane (the ambient HERMES_HOME) rather than leaving the
+        entry unset."""
+        import cron.scheduler as sched
+        import hermes_constants
+
+        assert hermes_constants.get_hermes_home_override() is None
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        assert sched.try_register_running_job("job-y") is True
+
+        assert sched._running_job_homes["job-y"] == str(tmp_path.resolve())
+
+    def test_release_clears_home(self):
+        import cron.scheduler as sched
+
+        sched._running_job_ids.add("job-x")
+        sched._running_job_homes["job-x"] = "/some/profile/home"
+
+        sched.release_running_job("job-x")
+
+        assert "job-x" not in sched._running_job_homes
+        assert "job-x" not in sched._running_job_ids
+
+    def test_home_capture_failure_falls_back_to_none_without_blocking_registration(self):
+        """A home-capture error must never stop the job from being
+        registered as running -- worst case the later interrupt-mark falls
+        back to the default store for just this one job, matching pre-fix
+        behavior; it must not lose in-flight tracking entirely."""
+        import cron.scheduler as sched
+
+        with patch("cron.scheduler.get_hermes_home", side_effect=RuntimeError("boom")):
+            assert sched.try_register_running_job("job-z") is True
+
+        assert sched._running_job_homes["job-z"] is None
+        assert "job-z" in sched._running_job_ids
+
+
+class TestMarkRunningJobsInterruptedScoping:
+    """#60432 follow-up (2026-08-24): root-caused incident -- the shutdown
+    path called mark_job_run() with no profile scope active, so every mark
+    landed in the DEFAULT cron store regardless of which profile actually
+    owned the job. Job d999d6f70e16 (owned by profile `trove`) was marked in
+    the default store; `cron.jobs.mark_job_run` logged "job_id ... not
+    found, skipping save" for the real (trove) record, which stayed wedged
+    'running' and froze the multiplex tick pass for 7.5h.
+
+    These tests exercise the real cron.jobs store (via use_cron_store()),
+    not a mocked mark_job_run, so they prove the fix at the file-scoping
+    level the incident actually broke at.
+    """
+
+    def test_scoped_to_owning_profile_not_default_store(self, tmp_path, monkeypatch):
+        import cron.jobs as jobs
+        import cron.scheduler as sched
+        import hermes_constants
+
+        default_home = tmp_path / "default"
+        profile_home = tmp_path / "profiles" / "trove"
+        default_home.mkdir(parents=True)
+        profile_home.mkdir(parents=True)
+
+        # The shutdown thread's ambient home -- must NOT receive the write.
+        monkeypatch.setenv("HERMES_HOME", str(default_home))
+
+        # Create the job directly in the profile's own store.
+        with jobs.use_cron_store(profile_home):
+            job = jobs.create_job(prompt="do work", schedule="every 1h")
+        job_id = job["id"]
+
+        # Simulate a normal tick's dispatch: try_register_running_job runs
+        # while the profile's scope is active on this thread, exactly as
+        # scheduler_provider._start_multiplex sets up around cron_tick().
+        home_token = hermes_constants.set_hermes_home_override(str(profile_home))
+        try:
+            with jobs.use_cron_store(profile_home):
+                assert sched.try_register_running_job(job_id) is True
+        finally:
+            hermes_constants.reset_hermes_home_override(home_token)
+
+        # Now simulate the shutdown thread: no profile scope active at all
+        # (the bug this fixes ran mark_job_run exactly like this).
+        assert hermes_constants.get_hermes_home_override() is None
+        marked = sched.mark_running_jobs_interrupted("gateway shutdown (test)")
+
+        assert marked == [job_id]
+
+        # The profile's OWN store carries the interrupted mark.
+        with jobs.use_cron_store(profile_home):
+            updated = jobs.get_job(job_id)
+        assert updated is not None
+        assert updated["last_status"] == "error"
+        assert "gateway shutdown (test)" in updated["last_error"]
+
+        # The default store was never touched -- no orphaned phantom entry,
+        # exactly the corruption the incident produced.
+        with jobs.use_cron_store(default_home):
+            assert jobs.load_jobs() == []
+
+    def test_not_found_in_owning_store_logs_error_and_is_excluded(self, tmp_path, monkeypatch, caplog):
+        """A job whose captured home doesn't actually contain it (scoping
+        still wrong somehow, or removed mid-run) must be LOUD, not a silent
+        WARNING indistinguishable from routine noise -- and must not be
+        reported to the caller as successfully marked."""
+        import logging
+
+        import cron.scheduler as sched
+        import hermes_constants
+
+        default_home = tmp_path / "default"
+        ghost_home = tmp_path / "profiles" / "ghost"
+        default_home.mkdir(parents=True)
+        ghost_home.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(default_home))
+
+        sched._running_job_ids.add("phantom-job")
+        sched._running_job_homes["phantom-job"] = str(ghost_home.resolve())
+
+        with caplog.at_level(logging.ERROR, logger="cron.scheduler"):
+            marked = sched.mark_running_jobs_interrupted("gateway shutdown (test)")
+
+        assert marked == []
+        assert any(
+            "not found in its owning store" in r.message for r in caplog.records
+        )
+
+    def test_no_captured_home_falls_back_to_default_store(self, tmp_path, monkeypatch):
+        """A job registered with no home captured (single-profile gateway,
+        or the pre-fix code path for anything that predates registration
+        tracking) must still get marked -- in the default store, same as
+        before this fix existed."""
+        import cron.jobs as jobs
+        import cron.scheduler as sched
+
+        default_home = tmp_path / "default"
+        default_home.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(default_home))
+
+        job = jobs.create_job(prompt="do work", schedule="every 1h")
+        sched._running_job_ids.add(job["id"])
+        sched._running_job_homes[job["id"]] = None
+
+        marked = sched.mark_running_jobs_interrupted("gateway shutdown (test)")
+
+        assert marked == [job["id"]]
+        updated = jobs.get_job(job["id"])
+        assert updated["last_status"] == "error"

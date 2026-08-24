@@ -473,6 +473,24 @@ _parallel_pool_max_workers: Optional[int] = None
 _running_job_ids: set = set()
 _running_lock = threading.Lock()
 
+# job_id -> owning profile's Hermes home (str), captured at the moment
+# ``try_register_running_job`` registers the job — i.e. while the tick's
+# ``use_cron_store()``/``set_hermes_home_override()`` context (set up per
+# profile by ``scheduler_provider._start_multiplex``) is still active on the
+# calling thread. ``None`` means "no override was active" (single-profile /
+# legacy gateway, or a manual run outside multiplex scope) — the caller
+# should use the default store, exactly as before this map existed.
+#
+# Without this, ``mark_running_jobs_interrupted`` (called from the gateway
+# shutdown path, a completely different thread with no profile context of
+# its own) cannot know which profile's cron store owns a given job_id, and
+# silently wrote every mark to whatever store happened to be the *default*
+# one — orphaning the real (profile-owned) job record and leaving it wedged
+# "running" forever while the default store grew a phantom entry for a job
+# id it doesn't recognize (root-caused 2026-08-24: job d999d6f70e16, owned
+# by profile `trove`, wedged the multiplex tick pass for 7.5h this way).
+_running_job_homes: dict = {}
+
 # Job IDs the gateway shutdown path force-killed the tool subprocess of
 # while still in ``_running_job_ids`` (see ``mark_running_jobs_interrupted``
 # below). ``run_one_job``'s own completion path checks this set before
@@ -517,11 +535,24 @@ def try_register_running_job(job_id: str) -> bool:
     gateway shutdown drain, #60432) and ``mark_running_jobs_interrupted``.
     Callers MUST pair a successful registration with
     ``release_running_job`` in a ``finally`` block.
+
+    Also snapshots the *owning profile's* Hermes home (``get_hermes_home()``,
+    which resolves any active ``set_hermes_home_override()``) into
+    ``_running_job_homes`` so a later shutdown-path interrupt-mark can scope
+    itself back to the same profile store the job was dispatched from — see
+    ``_running_job_homes`` above and ``mark_running_jobs_interrupted`` below.
     """
     with _running_lock:
         if job_id in _running_job_ids:
             return False
         _running_job_ids.add(job_id)
+        try:
+            _running_job_homes[job_id] = str(get_hermes_home().resolve())
+        except Exception:
+            # Never let home-capture failure block registration — worst case
+            # the interrupt-mark below falls back to the default store,
+            # matching pre-fix behavior for this one job.
+            _running_job_homes[job_id] = None
         return True
 
 
@@ -529,6 +560,7 @@ def release_running_job(job_id: str) -> None:
     """Remove ``job_id`` from the in-flight running set (idempotent)."""
     with _running_lock:
         _running_job_ids.discard(job_id)
+        _running_job_homes.pop(job_id, None)
 
 
 def mark_running_jobs_interrupted(reason: str) -> list:
@@ -554,14 +586,67 @@ def mark_running_jobs_interrupted(reason: str) -> list:
     per-agent correlation either.
 
     Returns the list of job IDs marked, for the caller to log.
+
+    Scoping (#60432 follow-up, 2026-08-24): each job is marked in ITS OWNING
+    PROFILE's cron store, the same way ``scheduler_provider._start_multiplex``
+    scopes a normal tick — via ``set_hermes_home_override()`` +
+    ``cron.jobs.use_cron_store()`` around the write. The owning home comes
+    from ``_running_job_homes``, captured by ``try_register_running_job`` at
+    dispatch time (while the tick's own profile scope was active on that
+    thread). This function itself runs on the shutdown thread, which carries
+    no profile context of its own — calling ``mark_job_run`` unscoped here
+    silently wrote every mark to the *default* store regardless of which
+    profile actually owned the job, orphaning the real record in a
+    multiplexed gateway (root-caused 2026-08-24: job d999d6f70e16, owned by
+    profile `trove`, marked in the default store instead — see
+    ``cron.jobs.mark_job_run``'s "not found, skipping save" warning that
+    immediately followed each mark in that incident).
     """
     with _running_lock:
         job_ids = list(_running_job_ids)
+        job_homes = {job_id: _running_job_homes.get(job_id) for job_id in job_ids}
         _interrupted_job_ids.update(job_ids)
     marked = []
     for job_id in job_ids:
+        home = job_homes.get(job_id)
         try:
-            mark_job_run(job_id, False, reason)
+            if home:
+                from hermes_constants import (
+                    set_hermes_home_override,
+                    reset_hermes_home_override,
+                )
+                from cron.jobs import use_cron_store
+
+                home_token = set_hermes_home_override(home)
+                try:
+                    with use_cron_store(home):
+                        found = mark_job_run(job_id, False, reason)
+                finally:
+                    reset_hermes_home_override(home_token)
+            else:
+                # No captured home — single-profile gateway or a job
+                # registered outside multiplex scope. Default-store write,
+                # matching pre-fix behavior for this case.
+                found = mark_job_run(job_id, False, reason)
+            if found is False:
+                # mark_job_run() already logged a WARNING ("not found,
+                # skipping save"); a job we ourselves registered as running
+                # that then isn't findable in what we believe is its own
+                # profile store means the scoping (or the home snapshot
+                # itself) is wrong — that must not be silent (#60432 follow-
+                # up). Loud ERROR, not a re-log of the same warning. Not
+                # counted in ``marked`` below — nothing was actually
+                # written, so the shutdown-path summary log must not claim
+                # it was.
+                logger.error(
+                    "mark_running_jobs_interrupted: job %s not found in "
+                    "its owning store (%s) — scoping is wrong or the job "
+                    "was removed mid-run; interrupted-mark for this job was "
+                    "LOST",
+                    job_id,
+                    home or "<default>",
+                )
+                continue
             marked.append(job_id)
         except Exception as e:
             logger.warning("Failed to mark job %s interrupted: %s", job_id, e)
