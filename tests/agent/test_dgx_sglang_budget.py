@@ -178,13 +178,39 @@ def test_clamp_raises_when_system_plus_last_turn_alone_exceed_budget():
         )
 
 
-def test_clamp_raises_when_no_middle_turns_exist_at_all():
+def test_clamp_shrinks_final_user_content_when_no_middle_turns_exist():
+    # Only one message, no middle to drop -- the OLD behavior (fixed here)
+    # raised immediately. The fix must instead shrink the final user
+    # message's own content from the middle before giving up, since a
+    # ceiling of 1000 can comfortably fit a truncated version of it.
+    messages = [_msg("user", "u" * 5000)]
+    trimmed, dropped_count, dropped_tokens = clamp_messages_to_token_budget(
+        messages,
+        max_tokens=10,
+        ceiling_tokens=1000,
+        token_counter=_counter(),
+        sanitize_fn=_identity_sanitize,
+    )
+    assert dropped_count == 0  # no whole message was removed
+    assert dropped_tokens > 0  # but content was shrunk
+    assert len(trimmed) == 1
+    assert trimmed[0]["role"] == "user"
+    assert trimmed[0]["content"]  # still a non-empty user message
+    assert len(trimmed[0]["content"]) < 5000
+    remaining_tokens = len(trimmed[0]["content"])
+    assert remaining_tokens + 10 <= 1000
+
+
+def test_clamp_raises_when_irreducible_minimum_still_exceeds_budget():
+    # Ceiling so tiny that even the floor-truncated final user message alone
+    # cannot fit -- this is the genuinely impossible case that must still
+    # raise rather than loop or silently send an over-budget request.
     messages = [_msg("user", "u" * 5000)]
     with pytest.raises(DgxSglangTokenBudgetError):
         clamp_messages_to_token_budget(
             messages,
             max_tokens=10,
-            ceiling_tokens=1000,
+            ceiling_tokens=50,
             token_counter=_counter(),
             sanitize_fn=_identity_sanitize,
         )
@@ -211,6 +237,102 @@ def test_clamp_terminates_when_sanitize_keeps_re_inflating():
             token_counter=_counter(),
             sanitize_fn=_re_inflate,
         )
+
+
+# ── Fix (2026-08-25): the final user message must never be dropped whole ──
+#
+# Live bug: genealogy-researcher log, 2026-08-25 02:46:01 AEST -- "dropped 24
+# oldest turn(s)... prompt 59,751 -> 49,079 tokens" immediately followed by
+# SGLang HTTP 400 "No user query found in messages." The tail this module
+# protected was literal index len(messages)-1. When the conversation's real
+# last array element is an assistant/tool message continuing to process the
+# latest user turn (not the user message itself), that single-index tail
+# protected the WRONG message, and the real final user turn -- sitting one
+# or more slots earlier, in what this function treats as "the middle" --
+# got dropped along with everything older than it, leaving zero user-role
+# messages. The fix anchors the tail on the last *user-role* message
+# instead of the last list index.
+
+
+def test_final_user_message_survives_even_when_it_is_not_the_last_list_item():
+    # Reproduces the exact shape of the live bug: the array's last element
+    # is a trailing assistant/tool exchange continuing to answer the final
+    # user turn, not the user turn itself. Old code's tail = index len-1 (a
+    # tool result) -- so the real final user message, one slot earlier,
+    # would be treated as an ordinary droppable "middle" message right along
+    # with the truly-old junk before it. The fix must keep it.
+    messages = [
+        _msg("system", "s" * 4),
+        _msg("user", "u" * 1000),  # oldest -- should be dropped
+        _msg("assistant", "a" * 1000),  # oldest -- should be dropped
+        _msg("user", "u" * 1000),  # oldest -- should be dropped
+        _msg("assistant", "a" * 1000),  # oldest -- should be dropped
+        _msg("user", "final query"),  # THE final user turn -- must survive
+        _tool_call_msg("continuing" * 5, "call_9"),  # still working that turn
+        _tool_result_msg("call_9", "tool output"),  # its result -- last item
+    ]
+    trimmed, dropped_count, _ = clamp_messages_to_token_budget(
+        messages,
+        max_tokens=10,
+        ceiling_tokens=100,
+        token_counter=_counter(),
+        sanitize_fn=_identity_sanitize,
+    )
+    assert dropped_count > 0
+    user_messages = [m for m in trimmed if m.get("role") == "user"]
+    assert len(user_messages) >= 1
+    assert any(m.get("content") == "final query" for m in user_messages)
+    # The trailing assistant/tool exchange attached to that final turn also
+    # survived untouched.
+    assert trimmed[-1]["role"] == "tool"
+    assert trimmed[-1]["tool_call_id"] == "call_9"
+
+
+def test_only_user_message_positioned_before_trailing_turns_is_kept():
+    # A conversation whose only user message is not the last list item is
+    # never left without a user message: everything from that lone user
+    # message onward (the model's own in-progress work on it) is protected
+    # tail, and only the droppable junk strictly before it is removed.
+    messages = [
+        _msg("system", "s" * 4),
+        _msg("assistant", "a" * 2000),  # droppable junk, not a user turn
+        _msg("user", "the only user turn"),
+        _tool_call_msg("x" * 10, "call_1"),
+        _tool_result_msg("call_1", "r"),
+    ]
+    trimmed, dropped_count, _ = clamp_messages_to_token_budget(
+        messages,
+        max_tokens=10,
+        ceiling_tokens=60,
+        token_counter=_counter(),
+        sanitize_fn=_identity_sanitize,
+    )
+    assert dropped_count == 1
+    user_messages = [m for m in trimmed if m.get("role") == "user"]
+    assert len(user_messages) == 1
+    assert user_messages[0]["content"] == "the only user turn"
+    assert all(m.get("content") != "a" * 2000 for m in trimmed)
+
+
+def test_system_messages_always_preserved_across_multiple_drops():
+    messages = [
+        _msg("system", "sys-1" * 2),
+        _msg("system", "sys-2" * 2),
+        _msg("user", "u" * 500),
+        _msg("assistant", "a" * 500),
+        _msg("user", "final"),
+    ]
+    trimmed, dropped_count, _ = clamp_messages_to_token_budget(
+        messages,
+        max_tokens=10,
+        ceiling_tokens=50,
+        token_counter=_counter(),
+        sanitize_fn=_identity_sanitize,
+    )
+    assert dropped_count >= 1
+    assert trimmed[0]["content"] == "sys-1" * 2
+    assert trimmed[1]["content"] == "sys-2" * 2
+    assert all(m["role"] != "system" for m in trimmed[2:])
 
 
 # ── Finding 2: tool_call / tool_result atomicity (real sanitize_fn) ──────
