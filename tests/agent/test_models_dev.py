@@ -1013,6 +1013,156 @@ class TestModelOverrides:
         warnings = [r for r in caplog.records if "model_overrides" in r.message]
         assert len(warnings) == 1
 
+    # --- _override_context_window drift-vs-declared-provider-config guard ---
+    #
+    # Regression coverage for the 2026-08-25 dgx-sglang trove-profile
+    # incident: ~/.hermes/profiles/trove/config.yaml declared BOTH
+    #   providers.dgx-ollama.models."RadixArk/Qwen3.8-27B-NVFP4".context_length: 131072
+    # (correct, matches the live SGLang /get_server_info window) AND
+    #   model_overrides.dgx-ollama."RadixArk/Qwen3.8-27B-NVFP4".context_window: 65536
+    # (stale, left over from before the model's context was bumped). Because
+    # the explicit override always wins (step 0b, agent/model_metadata.py),
+    # every trove-profile job silently ran the compressor and the dgx-sglang
+    # hard token-budget clamp against half the real window with no warning
+    # anywhere in the logs — turn-1 compression, a floored 20K-char SOUL.md
+    # cap, and outright DgxSglangTokenBudgetError job failures.
+
+    def _setup_declared_context(self, providers_dict):
+        """Patch load_config_readonly's providers section for the drift check."""
+        return patch(
+            "hermes_cli.config.load_config_readonly",
+            return_value={"providers": providers_dict},
+        )
+
+    def test_override_context_window_warns_when_below_declared(self, caplog):
+        """Override smaller than the same provider+model's declared
+        providers.<provider>.models.<model>.context_length logs a one-shot
+        warning naming both numbers, without changing the returned value."""
+        import logging
+
+        import agent.models_dev as md
+        md._OVERRIDE_DRIFT_WARNED_KEYS.clear()
+        overrides = {
+            "dgx-ollama": {
+                "RadixArk/Qwen3.8-27B-NVFP4": {"context_window": 65536},
+            },
+        }
+        providers = {
+            "dgx-ollama": {
+                "models": {
+                    "RadixArk/Qwen3.8-27B-NVFP4": {"context_length": 131072},
+                },
+            },
+        }
+        with self._setup_overrides(overrides), \
+             self._setup_declared_context(providers), \
+             caplog.at_level(logging.WARNING):
+            ctx = _override_context_window("dgx-ollama", "RadixArk/Qwen3.8-27B-NVFP4")
+        assert ctx == 65536  # explicit override still wins the return value
+        drift_warnings = [
+            r for r in caplog.records
+            if "model_overrides" in r.message and "65536" in r.message and "131072" in r.message
+        ]
+        assert len(drift_warnings) == 1
+
+    def test_override_context_window_no_warn_when_matches_declared(self, caplog):
+        """No warning when the override agrees with the declared value."""
+        import logging
+
+        import agent.models_dev as md
+        md._OVERRIDE_DRIFT_WARNED_KEYS.clear()
+        overrides = {
+            "dgx-ollama": {
+                "RadixArk/Qwen3.8-27B-NVFP4": {"context_window": 131072},
+            },
+        }
+        providers = {
+            "dgx-ollama": {
+                "models": {
+                    "RadixArk/Qwen3.8-27B-NVFP4": {"context_length": 131072},
+                },
+            },
+        }
+        with self._setup_overrides(overrides), \
+             self._setup_declared_context(providers), \
+             caplog.at_level(logging.WARNING):
+            ctx = _override_context_window("dgx-ollama", "RadixArk/Qwen3.8-27B-NVFP4")
+        assert ctx == 131072
+        assert not [r for r in caplog.records if "model_overrides" in r.message]
+
+    def test_override_context_window_no_warn_when_no_declared_value(self, caplog):
+        """No declared providers.<provider>.models.<model>.context_length to
+        compare against -> nothing to warn about (e.g. a purely custom/local
+        model with no separate provider-level declaration)."""
+        import logging
+
+        import agent.models_dev as md
+        md._OVERRIDE_DRIFT_WARNED_KEYS.clear()
+        overrides = {
+            "upstage": {
+                "syn-pro": {"context_window": 65536},
+            },
+        }
+        with self._setup_overrides(overrides), \
+             self._setup_declared_context({}), \
+             caplog.at_level(logging.WARNING):
+            ctx = _override_context_window("upstage", "syn-pro")
+        assert ctx == 65536
+        assert not [r for r in caplog.records if "model_overrides" in r.message]
+
+    def test_override_context_window_drift_warns_once(self, caplog):
+        """Repeated lookups of the same drifted provider+model log once."""
+        import logging
+
+        import agent.models_dev as md
+        md._OVERRIDE_DRIFT_WARNED_KEYS.clear()
+        overrides = {
+            "dgx-ollama": {
+                "RadixArk/Qwen3.8-27B-NVFP4": {"context_window": 65536},
+            },
+        }
+        providers = {
+            "dgx-ollama": {
+                "models": {
+                    "RadixArk/Qwen3.8-27B-NVFP4": {"context_length": 131072},
+                },
+            },
+        }
+        with self._setup_overrides(overrides), \
+             self._setup_declared_context(providers), \
+             caplog.at_level(logging.WARNING):
+            _override_context_window("dgx-ollama", "RadixArk/Qwen3.8-27B-NVFP4")
+            _override_context_window("dgx-ollama", "RadixArk/Qwen3.8-27B-NVFP4")
+        drift_warnings = [r for r in caplog.records if "model_overrides" in r.message]
+        assert len(drift_warnings) == 1
+
+    def test_override_context_window_no_warn_when_override_larger(self, caplog):
+        """An override LARGER than the declared value is a deliberate
+        operator choice (e.g. testing a bigger window) — not drift, no
+        warning."""
+        import logging
+
+        import agent.models_dev as md
+        md._OVERRIDE_DRIFT_WARNED_KEYS.clear()
+        overrides = {
+            "dgx-ollama": {
+                "RadixArk/Qwen3.8-27B-NVFP4": {"context_window": 200000},
+            },
+        }
+        providers = {
+            "dgx-ollama": {
+                "models": {
+                    "RadixArk/Qwen3.8-27B-NVFP4": {"context_length": 131072},
+                },
+            },
+        }
+        with self._setup_overrides(overrides), \
+             self._setup_declared_context(providers), \
+             caplog.at_level(logging.WARNING):
+            ctx = _override_context_window("dgx-ollama", "RadixArk/Qwen3.8-27B-NVFP4")
+        assert ctx == 200000
+        assert not [r for r in caplog.records if "model_overrides" in r.message]
+
     # --- get_model_capabilities with overrides ---
 
     def test_caps_override_unknown_model(self):
