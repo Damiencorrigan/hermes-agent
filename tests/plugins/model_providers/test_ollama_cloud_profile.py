@@ -216,6 +216,57 @@ class TestOllamaModelSupportsThinking:
             ollama_model_supports_thinking("x", "https://ollama.com/v1", "key") is None
         )
 
+    def test_sends_both_name_and_model_keys(self, monkeypatch):
+        """SGLang's Ollama-compat /api/show (ollama_show handler) requires the
+        field named 'model', not 'name' -- Ollama's own historical contract.
+        Sending 'name' alone 400s on SGLang with a pydantic 'model: Field
+        required' error (proven 2026-08-25 against the DGX canary at :30000,
+        task-queue row ece1213818cd). This pins the wire-shape contract so a
+        future edit can't silently drop the 'model' key again."""
+        import httpx
+
+        from hermes_cli.models import ollama_model_supports_thinking
+
+        captured = {}
+
+        class _Resp:
+            status_code = 200
+
+            def json(self):
+                return {"capabilities": ["completion", "thinking"]}
+
+        class _Client:
+            def __init__(self, *a, **k):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def post(self, url, json=None, **k):
+                captured["json"] = json
+                # Mimic SGLang's stricter pydantic schema: 400 unless 'model'
+                # is present, regardless of whether 'name' is also present.
+                if not json or "model" not in json:
+                    return type(
+                        "_Bad", (), {"status_code": 400, "json": lambda self: {}}
+                    )()
+                return _Resp()
+
+        monkeypatch.setattr(httpx, "Client", _Client)
+
+        result = ollama_model_supports_thinking(
+            "deepseek-v4-pro", "https://ollama.com/v1", "key"
+        )
+
+        assert captured["json"] == {
+            "name": "deepseek-v4-pro",
+            "model": "deepseek-v4-pro",
+        }
+        assert result is True
+
     def test_exception_returns_none(self, monkeypatch):
         from hermes_cli.models import ollama_model_supports_thinking
 
