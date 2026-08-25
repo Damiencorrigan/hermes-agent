@@ -4192,7 +4192,13 @@ def ollama_model_supports_thinking(
 
     try:
         with httpx.Client(timeout=timeout, headers=headers) as client:
-            resp = client.post(f"{server_url}/api/show", json={"name": bare_model})
+            # SGLang's Ollama-compat /api/show (ollama_show handler) requires
+            # the field named 'model', not 'name' -- Ollama's own historical
+            # contract. Sending 'name' alone 400s on SGLang with a pydantic
+            # 'model: Field required' error (proven 2026-08-25 against the DGX
+            # canary at :30000, task-queue row ece1213818cd). Sending both keys
+            # satisfies SGLang and is a no-op extra field for real Ollama.
+            resp = client.post(f"{server_url}/api/show", json={"name": bare_model, "model": bare_model})
             if resp.status_code != 200:
                 return None
             caps = resp.json().get("capabilities")
