@@ -181,6 +181,121 @@ def _default_sanitize(messages: list) -> list:
     return sanitize_api_messages(messages)
 
 
+def _protected_head(msgs: list) -> int:
+    """Index of the first non-``system`` message — everything before it is
+    a leading system message and is never a candidate for removal."""
+    head = 0
+    while (
+        head < len(msgs)
+        and isinstance(msgs[head], dict)
+        and msgs[head].get("role") == "system"
+    ):
+        head += 1
+    return head
+
+
+def _find_last_user_index(msgs: list) -> Optional[int]:
+    """Index of the last ``user``-role message, or ``None`` if there is none.
+
+    This is the anchor for the protected tail (see ``_protected_tail_start``)
+    rather than the raw last list index. A conversation mid tool-round-trip
+    can end with an ``assistant``/``tool`` message *after* the latest user
+    turn (the model is still working the tools that turn triggered) — if the
+    tail only ever protected literal index ``len(msgs) - 1``, that trailing
+    non-user message would be "the tail" and the real final user message,
+    sitting one or more slots earlier, would be treated as an ordinary
+    trimmable middle message and could be dropped along with everything
+    older. That is exactly what produced the live 2026-08-25 bug: 24 oldest
+    turns dropped, taking every ``user``-role message with them, followed by
+    SGLang's ``400 "No user query found in messages."``
+    """
+    for i in range(len(msgs) - 1, -1, -1):
+        m = msgs[i]
+        if isinstance(m, dict) and m.get("role") == "user":
+            return i
+    return None
+
+
+def _protected_tail_start(msgs: list, head: int) -> int:
+    """Index where the protected tail begins.
+
+    The tail is the final ``user``-role message through the end of the
+    list — the latest turn the model must respond to, plus any tool
+    round-trips already attached to answering it. Every message at or after
+    this index is never dropped whole; if the budget still doesn't fit once
+    every message before it is gone, the final user message's own content
+    is shrunk from the middle instead (see ``_try_shrink_final_user_content``).
+    Falls back to protecting just the literal last message when no
+    ``user``-role message exists at all (defensive; not expected on a real
+    send path).
+    """
+    last_user = _find_last_user_index(msgs)
+    if last_user is not None:
+        return max(last_user, head)
+    return max(len(msgs) - 1, head)
+
+
+# Minimum characters kept on each side of the truncation marker when
+# shrinking the final user message's own content — the last resort before
+# raising. Small enough to meaningfully shrink a huge payload, large enough
+# that the surviving head/tail fragments are still useful context.
+_TRUNCATION_FLOOR_CHARS = 200
+
+_TRUNCATION_MARKER_TEMPLATE = (
+    "\n...[dgx-sglang budget: {n} chars truncated from the middle]...\n"
+)
+
+
+def _truncate_middle(text: str, target_len: int) -> str:
+    """Cut ``text`` down to roughly ``target_len`` chars total, keeping the
+    start and end and replacing the removed middle with a marker."""
+    if len(text) <= target_len:
+        return text
+    head_keep = target_len // 2
+    tail_keep = target_len - head_keep
+    removed = len(text) - head_keep - tail_keep
+    marker = _TRUNCATION_MARKER_TEMPLATE.format(n=f"{removed:,}")
+    if tail_keep <= 0:
+        return text[:head_keep] + marker
+    return text[:head_keep] + marker + text[-tail_keep:]
+
+
+def _try_shrink_final_user_content(
+    working: list,
+    index: int,
+    *,
+    max_tokens: int,
+    ceiling_tokens: int,
+    token_counter: Callable[[list], int],
+) -> Optional[list]:
+    """Last resort: shrink ``working[index]``'s own content from the middle
+    (rather than dropping the message) until the request fits.
+
+    Only handles plain string ``content`` — the common case for a user
+    turn. Halves the retained-character target each attempt down to
+    ``_TRUNCATION_FLOOR_CHARS``. Returns the new message list on success, or
+    ``None`` if even the floor-truncated content still doesn't fit (the
+    caller must then raise — there is nothing left to trim).
+    """
+    message = working[index]
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, str) or not content:
+        return None
+
+    target = len(content)
+    while True:
+        target = target // 2
+        if target < _TRUNCATION_FLOOR_CHARS:
+            target = _TRUNCATION_FLOOR_CHARS
+        truncated = _truncate_middle(content, target)
+        candidate = list(working)
+        candidate[index] = {**message, "content": truncated}
+        if token_counter(candidate) + max_tokens <= ceiling_tokens:
+            return candidate
+        if target <= _TRUNCATION_FLOOR_CHARS:
+            return None
+
+
 def clamp_messages_to_token_budget(
     messages: list,
     *,
@@ -191,10 +306,11 @@ def clamp_messages_to_token_budget(
 ) -> tuple[list, int, int]:
     """Drop the oldest trimmable turns until the request fits the ceiling.
 
-    Preserves every leading ``system``-role message and the final message
-    (the latest turn the model must respond to) — those are never
-    candidates for removal. Turns are dropped oldest-first from the
-    remaining middle section, one message at a time, until
+    Preserves every leading ``system``-role message and the protected tail
+    — the final ``user``-role message through the end of the list (see
+    ``_protected_tail_start``) — those are never candidates for whole-message
+    removal. Turns are dropped oldest-first from the remaining middle
+    section, one message at a time, until
     ``prompt_tokens + max_tokens <= ceiling_tokens``.
 
     After every single-message drop, ``sanitize_fn`` (defaults to hermes's
@@ -208,17 +324,26 @@ def clamp_messages_to_token_budget(
     *current* working list on every iteration rather than computed once
     up front.
 
+    If every whole-message drop is exhausted (nothing left between the
+    protected head and the protected tail) and the request still doesn't
+    fit, the final user message's own content is shrunk from the middle
+    (``_try_shrink_final_user_content``) rather than dropping that message
+    — this is what guarantees the final user turn is never removed outright,
+    which is what let a prior version of this clamp strip every user-role
+    message and send a request SGLang rejected with
+    ``400 "No user query found in messages."``.
+
     Returns ``(trimmed_messages, dropped_count, dropped_tokens)``. When the
     input already fits, returns the input unchanged with
-    ``dropped_count == 0``.
+    ``dropped_count == 0``. ``dropped_count`` only counts whole messages
+    removed — content-shrink alone (no whole message dropped) still reports
+    ``dropped_count == 0`` with a positive ``dropped_tokens``.
 
     Raises ``DgxSglangTokenBudgetError`` when even the protected head
-    (system messages) plus the protected tail (the latest turn) alone
-    cannot fit under the ceiling, or when repeated sanitize-driven
-    re-inflation prevents convergence within a bounded number of
-    iterations — either way, there is nothing left this function is
-    permitted to trim, and sending anyway would just reproduce the 400
-    this clamp exists to prevent.
+    (system messages) plus the protected tail, shrunk to the content floor,
+    still cannot fit under the ceiling — there is nothing left this
+    function is permitted to trim, and sending anyway would just reproduce
+    the 400 this clamp exists to prevent.
     """
     if not messages:
         return messages, 0, 0
@@ -229,16 +354,6 @@ def clamp_messages_to_token_budget(
     original_tokens = token_counter(messages)
     if original_tokens + max_tokens <= ceiling_tokens:
         return messages, 0, 0
-
-    def _protected_head(msgs: list) -> int:
-        head = 0
-        while (
-            head < len(msgs)
-            and isinstance(msgs[head], dict)
-            and msgs[head].get("role") == "system"
-        ):
-            head += 1
-        return head
 
     working = list(messages)
     dropped_count = 0
@@ -251,26 +366,40 @@ def clamp_messages_to_token_budget(
     for _ in range(max_iterations):
         current_tokens = token_counter(working)
         if current_tokens + max_tokens <= ceiling_tokens:
-            break
+            dropped_tokens = original_tokens - current_tokens
+            return working, dropped_count, dropped_tokens
         head = _protected_head(working)
-        tail_start = max(len(working) - 1, head)
+        tail_start = _protected_tail_start(working, head)
         if tail_start <= head:
-            raise DgxSglangTokenBudgetError(
-                _budget_error_text(current_tokens, max_tokens, ceiling_tokens)
-            )
+            break  # nothing left to drop as a whole message
         del working[head]
         dropped_count += 1
         working = sanitize_fn(working)
-    else:
-        raise DgxSglangTokenBudgetError(
-            _budget_error_text(token_counter(working), max_tokens, ceiling_tokens)
+
+    # Whole-message dropping is exhausted (or was never possible). Try
+    # shrinking the final user message's own content before giving up.
+    current_tokens = token_counter(working)
+    if current_tokens + max_tokens <= ceiling_tokens:
+        dropped_tokens = original_tokens - current_tokens
+        return working, dropped_count, dropped_tokens
+
+    head = _protected_head(working)
+    tail_index = _find_last_user_index(working)
+    if tail_index is not None and tail_index >= head:
+        shrunk = _try_shrink_final_user_content(
+            working,
+            tail_index,
+            max_tokens=max_tokens,
+            ceiling_tokens=ceiling_tokens,
+            token_counter=token_counter,
         )
+        if shrunk is not None:
+            dropped_tokens = original_tokens - token_counter(shrunk)
+            return shrunk, dropped_count, dropped_tokens
 
-    if dropped_count == 0:
-        return messages, 0, 0
-
-    dropped_tokens = original_tokens - token_counter(working)
-    return working, dropped_count, dropped_tokens
+    raise DgxSglangTokenBudgetError(
+        _budget_error_text(token_counter(working), max_tokens, ceiling_tokens)
+    )
 
 
 def _log_and_apply(
