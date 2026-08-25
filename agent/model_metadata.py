@@ -1835,7 +1835,13 @@ def query_ollama_num_ctx(model: str, base_url: str, api_key: str = "") -> Option
 
     try:
         with httpx.Client(timeout=3.0, headers=headers) as client:
-            resp = client.post(f"{server_url}/api/show", json={"name": bare_model})
+            # SGLang's Ollama-compat /api/show (ollama_show handler) requires
+            # the field named 'model', not 'name' -- Ollama's own historical
+            # contract. Sending 'name' alone 400s on SGLang with a pydantic
+            # 'model: Field required' error (proven 2026-08-25 against the DGX
+            # canary at :30000, task-queue row 6d294f6da562). Sending both keys
+            # satisfies SGLang and is a no-op extra field for real Ollama.
+            resp = client.post(f"{server_url}/api/show", json={"name": bare_model, "model": bare_model})
             if resp.status_code != 200:
                 return None
             data = resp.json()
@@ -1893,7 +1899,13 @@ def query_ollama_supports_vision(model: str, base_url: str, api_key: str = "") -
 
     try:
         with httpx.Client(timeout=3.0, headers=headers) as client:
-            resp = client.post(f"{server_url}/api/show", json={"name": bare_model})
+            # SGLang's Ollama-compat /api/show (ollama_show handler) requires
+            # the field named 'model', not 'name' -- Ollama's own historical
+            # contract. Sending 'name' alone 400s on SGLang with a pydantic
+            # 'model: Field required' error (proven 2026-08-25 against the DGX
+            # canary at :30000, task-queue row 6d294f6da562). Sending both keys
+            # satisfies SGLang and is a no-op extra field for real Ollama.
+            resp = client.post(f"{server_url}/api/show", json={"name": bare_model, "model": bare_model})
             if resp.status_code != 200:
                 return None
             data = resp.json()
@@ -1973,7 +1985,13 @@ def _query_ollama_api_show_uncached(model: str, base_url: str, api_key: str = ""
 
     try:
         with httpx.Client(timeout=5.0, headers=headers) as client:
-            resp = client.post(f"{server_url}/api/show", json={"name": model})
+            # SGLang's Ollama-compat /api/show (ollama_show handler) requires
+            # the field named 'model', not 'name' -- Ollama's own historical
+            # contract. Sending 'name' alone 400s on SGLang with a pydantic
+            # 'model: Field required' error (proven 2026-08-25 against the DGX
+            # canary at :30000, task-queue row 6d294f6da562). Sending both keys
+            # satisfies SGLang and is a no-op extra field for real Ollama.
+            resp = client.post(f"{server_url}/api/show", json={"name": model, "model": model})
             if resp.status_code != 200:
                 return None
             data = resp.json()
@@ -2160,7 +2178,13 @@ def _query_local_context_length_uncached(model: str, base_url: str, api_key: str
         with httpx.Client(timeout=3.0, headers=headers) as client:
             # Ollama: /api/show returns model details with context info
             if server_type == "ollama":
-                resp = client.post(f"{server_url}/api/show", json={"name": model})
+                # SGLang's Ollama-compat /api/show (ollama_show handler) requires
+                # the field named 'model', not 'name' -- Ollama's own historical
+                # contract. Sending 'name' alone 400s on SGLang with a pydantic
+                # 'model: Field required' error (proven 2026-08-25 against the DGX
+                # canary at :30000, task-queue row 6d294f6da562). Sending both keys
+                # satisfies SGLang and is a no-op extra field for real Ollama.
+                resp = client.post(f"{server_url}/api/show", json={"name": model, "model": model})
                 if resp.status_code == 200:
                     data = resp.json()
                     # Prefer explicit num_ctx from Modelfile parameters: this is
