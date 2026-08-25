@@ -880,6 +880,10 @@ class ModelCapabilities:
 
 _OVERRIDE_WARNED_KEYS: set = set()
 
+# Warn-once keys for the drift guard below (provider, model, override_value,
+# declared_value) — same one-shot pattern as _OVERRIDE_WARNED_KEYS.
+_OVERRIDE_DRIFT_WARNED_KEYS: set = set()
+
 
 def _load_model_overrides() -> Dict[str, Any]:
     """Load the ``model_overrides`` config section.
@@ -1021,7 +1025,85 @@ def _override_context_window(provider: str, model: str) -> Optional[int]:
     ov = _explicit_model_override(provider, model)
     if ov is None:
         return None
-    return _override_int(ov, "context_window")
+    value = _override_int(ov, "context_window")
+    if value is not None:
+        _warn_if_override_below_declared(provider, model, value)
+    return value
+
+
+def _declared_provider_context_length(provider: str, model: str) -> Optional[int]:
+    """Read ``providers.<provider>.models.<model>.context_length`` straight
+    from config — the OTHER place (besides ``model_overrides``) an operator
+    declares this same real number, for the SAME provider+model, in the
+    SAME config.yaml. Returns None on any miss or read failure.
+    """
+    try:
+        from hermes_cli.config import cfg_get, load_config_readonly
+
+        config = load_config_readonly()
+        candidates = [provider]
+        mapped = PROVIDER_TO_MODELS_DEV.get(provider)
+        if mapped and mapped != provider:
+            candidates.append(mapped)
+        for hermes_id in _models_dev_to_hermes_ids(provider):
+            if hermes_id != provider:
+                candidates.append(hermes_id)
+        for key in candidates:
+            declared = cfg_get(config, "providers", key, "models", model, "context_length")
+            if declared is not None:
+                declared_int = int(declared)
+                if declared_int > 0:
+                    return declared_int
+    except Exception:
+        logger.debug("model_overrides: declared context_length lookup failed", exc_info=True)
+    return None
+
+
+def _warn_if_override_below_declared(provider: str, model: str, override_value: int) -> None:
+    """Warn once when an explicit ``model_overrides`` context_window is
+    smaller than the same provider+model's declared ``providers.<provider>.
+    models.<model>.context_length`` in the same config.
+
+    Both keys describe the same real number (the model's context window)
+    but live in different config sections, and the override always wins
+    (see the module docstring) — so if the declared value is later
+    corrected (e.g. after a model upgrade) but a leftover override entry
+    from before the correction is never updated, every downstream
+    compression/budget calculation silently keeps using the smaller, stale
+    number with nothing in the logs to say why.
+
+    Root-caused 2026-08-25: ``~/.hermes/profiles/trove/config.yaml`` had
+    ``providers.dgx-ollama.models."RadixArk/Qwen3.8-27B-NVFP4".
+    context_length: 131072`` (correct, matches the live SGLang
+    ``/get_server_info`` window) alongside a stale ``model_overrides.
+    dgx-ollama."RadixArk/Qwen3.8-27B-NVFP4".context_window: 65536`` left
+    over from before the model's context was bumped. The override won (by
+    design), so every trove-profile job on this model silently ran
+    compression and the dgx-sglang hard token-budget clamp against half
+    the real window — turn-1 compression, a floored 20K-char SOUL.md cap,
+    and outright ``DgxSglangTokenBudgetError`` job failures — with no
+    warning anywhere until an operator diffed the two config keys by hand.
+
+    Only fires when the override is SMALLER than the declared value: a
+    LARGER override is a deliberate choice (e.g. deliberately testing a
+    bigger window) and not drift.
+    """
+    declared = _declared_provider_context_length(provider, model)
+    if declared is None or override_value >= declared:
+        return
+    warn_key = (provider, model, override_value, declared)
+    if warn_key in _OVERRIDE_DRIFT_WARNED_KEYS:
+        return
+    _OVERRIDE_DRIFT_WARNED_KEYS.add(warn_key)
+    logger.warning(
+        "model_overrides: %s/%s context_window=%s is BELOW the declared "
+        "providers.%s.models.%s.context_length=%s in the same config — "
+        "the explicit override always wins, so every request is silently "
+        "clamped to the smaller, likely-stale number. If %s tokens is not "
+        "deliberate, update model_overrides.%s.%s.context_window to %s.",
+        provider, model, override_value, provider, model, declared,
+        override_value, provider, model, declared,
+    )
 
 
 def _override_to_catalog_shape(
