@@ -224,6 +224,53 @@ class TestOllamaModelSupportsThinking:
             ollama_model_supports_thinking("x", "https://ollama.com/v1", "key") is None
         )
 
+    def test_api_show_payload_sends_both_name_and_model_keys(self, monkeypatch):
+        """SGLang's Ollama-compat /api/show (ollama_show handler) 400s on a
+        payload that only has 'name' — it requires 'model' (proven
+        2026-08-25 against the DGX canary, fixed for the other four
+        /api/show call sites by #11/12d29dcad; this is the fifth site,
+        missed by that PR and fixed 2026-08-26). Pin the payload shape so
+        a future edit can't silently drop the 'model' key again."""
+        import httpx
+
+        from hermes_cli.models import ollama_model_supports_thinking
+
+        captured = {}
+
+        class _Resp:
+            status_code = 200
+
+            def json(self):
+                return {"capabilities": ["completion", "thinking"]}
+
+        class _Client:
+            def __init__(self, *a, **k):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def post(self, url, json=None, **k):
+                captured["url"] = url
+                captured["json"] = json
+                return _Resp()
+
+        monkeypatch.setattr(httpx, "Client", _Client)
+
+        result = ollama_model_supports_thinking(
+            "RadixArk/Qwen3.8-27B-NVFP4", "http://192.168.0.214:30000/v1", None
+        )
+
+        assert result is True
+        assert captured["json"] == {
+            "name": "RadixArk/Qwen3.8-27B-NVFP4",
+            "model": "RadixArk/Qwen3.8-27B-NVFP4",
+        }
+        assert captured["url"] == "http://192.168.0.214:30000/api/show"
+
 
 class TestOllamaCloudAuxModel:
     """Ollama Cloud aux model is set on the profile."""

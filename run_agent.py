@@ -6167,9 +6167,17 @@ class AIAgent:
             )
 
     def _interruptible_api_call(self, api_kwargs: dict):
-        """Forwarder — see ``agent.chat_completion_helpers.interruptible_api_call``."""
+        """Forwarder — see ``agent.chat_completion_helpers.interruptible_api_call``.
+
+        Wrapped in ``dgx_request_guard`` (2026-08-26 HERMES-BOUND): a no-op
+        for every provider except the DGX SGLang canary, where it reserves a
+        concurrency slot from the SAME shared pool fleet_router.py uses
+        before the request is sent — see agent/dgx_context_guard.py.
+        """
         from agent.chat_completion_helpers import interruptible_api_call
-        return interruptible_api_call(self, api_kwargs)
+        from agent.dgx_context_guard import dgx_request_guard
+        with dgx_request_guard(self, api_kwargs):
+            return interruptible_api_call(self, api_kwargs)
 
     # ── Unified streaming API call ─────────────────────────────────────────
 
@@ -6659,9 +6667,19 @@ class AIAgent:
     def _interruptible_streaming_api_call(
         self, api_kwargs: dict, *, on_first_delta: callable = None
     ):
-        """Forwarder — see ``agent.chat_completion_helpers.interruptible_streaming_api_call``."""
+        """Forwarder — see ``agent.chat_completion_helpers.interruptible_streaming_api_call``.
+
+        Wrapped in ``dgx_request_guard`` (2026-08-26 HERMES-BOUND) — see
+        ``_interruptible_api_call`` above for what that does. This is the
+        streaming sibling and the ONLY other call site that reaches the
+        wire (agent/conversation_loop.py calls exactly one of these two
+        methods per live turn), so together they cover every Hermes chat
+        completion, streamed or not, interactive, cron, or delegated.
+        """
         from agent.chat_completion_helpers import interruptible_streaming_api_call
-        return interruptible_streaming_api_call(self, api_kwargs, on_first_delta=on_first_delta)
+        from agent.dgx_context_guard import dgx_request_guard
+        with dgx_request_guard(self, api_kwargs):
+            return interruptible_streaming_api_call(self, api_kwargs, on_first_delta=on_first_delta)
 
     def _try_activate_fallback(self, reason: "FailoverReason | None" = None) -> bool:
         """Forwarder — see ``agent.chat_completion_helpers.try_activate_fallback``."""
