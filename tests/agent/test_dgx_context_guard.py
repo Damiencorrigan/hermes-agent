@@ -178,7 +178,8 @@ class TestDgxRequestGuard:
 
     def test_acquires_shared_pool_for_dgx_target(self, fake_ai_fleet, monkeypatch):
         monkeypatch.delenv("HERMES_DGX_GUARD_HOSTS", raising=False)
-        monkeypatch.setenv("HERMES_PROFILE", "fleet-overseer")
+        import hermes_cli.profiles as profiles_mod
+        monkeypatch.setattr(profiles_mod, "get_active_profile_name", lambda: "fleet-overseer")
         m = fake_ai_fleet
         agent = SimpleNamespace(base_url="http://192.168.0.214:30000/v1")
         with m.dgx_request_guard(agent, {"messages": [{"role": "user", "content": "hi"}], "tools": []}):
@@ -191,7 +192,8 @@ class TestDgxRequestGuard:
 
     def test_big_prompt_uses_long_timeout(self, fake_ai_fleet, monkeypatch):
         monkeypatch.delenv("HERMES_DGX_GUARD_HOSTS", raising=False)
-        monkeypatch.setenv("HERMES_PROFILE", "ta-desk")
+        import hermes_cli.profiles as profiles_mod
+        monkeypatch.setattr(profiles_mod, "get_active_profile_name", lambda: "ta-desk")
         m = fake_ai_fleet
         agent = SimpleNamespace(base_url="http://192.168.0.214:30000/v1")
         big_content = "x" * 400_000  # well over 80,000 tokens at chars/3.5
@@ -203,16 +205,56 @@ class TestDgxRequestGuard:
         assert call["timeout_s"] == m.BIG_PROMPT_WAIT_TIMEOUT_S
         assert call["prompt_tokens"] > 80_000
 
-    def test_profile_name_defaults_when_env_unset(self, fake_ai_fleet, monkeypatch):
+    def test_profile_name_defaults_when_lookup_returns_default(self, fake_ai_fleet, monkeypatch):
         monkeypatch.delenv("HERMES_DGX_GUARD_HOSTS", raising=False)
-        monkeypatch.delenv("HERMES_PROFILE", raising=False)
-        monkeypatch.delenv("HERMES_PROFILE_NAME", raising=False)
+        import hermes_cli.profiles as profiles_mod
+        monkeypatch.setattr(profiles_mod, "get_active_profile_name", lambda: "default")
         m = fake_ai_fleet
         agent = SimpleNamespace(base_url="http://192.168.0.214:30000/v1")
         with m.dgx_request_guard(agent, {"messages": [], "tools": []}):
             pass
         guard = m._load_guard_module()
         assert guard.calls[0]["caller_label"] == "hermes:default"
+
+
+class TestProfileNameResolution:
+    """_profile_name() prefers hermes_cli.profiles.get_active_profile_name()
+    (context-var-backed, correct even inside the multiplexer's single
+    process serving many profiles concurrently) over the HERMES_PROFILE /
+    HERMES_PROFILE_NAME env-var pair, which is process-global and was
+    proven wrong live: a real `hermes --profile fleet-overseer -z` probe
+    logged caller=hermes:default because those env vars are never actually
+    exported by any Hermes entry point (2026-08-26 HERMES-BOUND mission)."""
+
+    def test_uses_get_active_profile_name_when_available(self, monkeypatch):
+        import agent.dgx_context_guard as m
+        import hermes_cli.profiles as profiles_mod
+        monkeypatch.setattr(profiles_mod, "get_active_profile_name", lambda: "genealogy-researcher")
+        monkeypatch.setenv("HERMES_PROFILE", "should-be-ignored")
+        assert m._profile_name() == "genealogy-researcher"
+
+    def test_falls_back_to_env_var_when_lookup_raises(self, monkeypatch):
+        import agent.dgx_context_guard as m
+        import hermes_cli.profiles as profiles_mod
+
+        def _boom():
+            raise RuntimeError("no context")
+
+        monkeypatch.setattr(profiles_mod, "get_active_profile_name", _boom)
+        monkeypatch.setenv("HERMES_PROFILE", "ta-desk")
+        assert m._profile_name() == "ta-desk"
+
+    def test_falls_back_to_default_when_lookup_raises_and_no_env(self, monkeypatch):
+        import agent.dgx_context_guard as m
+        import hermes_cli.profiles as profiles_mod
+
+        def _boom():
+            raise RuntimeError("no context")
+
+        monkeypatch.setattr(profiles_mod, "get_active_profile_name", _boom)
+        monkeypatch.delenv("HERMES_PROFILE", raising=False)
+        monkeypatch.delenv("HERMES_PROFILE_NAME", raising=False)
+        assert m._profile_name() == "default"
 
     def test_timeout_error_propagates_unchanged(self, fake_ai_fleet, monkeypatch, tmp_path):
         """A DGXContextGuardTimeoutError from the shared guard must reach the

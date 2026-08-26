@@ -189,11 +189,35 @@ def is_dgx_target(base_url: str) -> bool:
 def _profile_name() -> str:
     """The active Hermes profile, for guard-log attribution.
 
-    Same env-var pair (and precedence) hermes_cli/runtime_provider.py
-    already reads for its own diagnostics — kept consistent so a slot
-    holder in the guard log matches what the rest of Hermes calls "the
-    profile" elsewhere.
+    Primary source: ``hermes_cli.profiles.get_active_profile_name()`` — the
+    same call run_agent.py itself uses to stamp a session's profile_name at
+    session-creation time. It resolves through
+    ``hermes_constants.get_hermes_home()``, whose top preference is a
+    ``contextvars.ContextVar`` override (``_HERMES_HOME_OVERRIDE``), so it
+    is correctly per-async-context even inside the multiplexer gateway
+    process, which serves many profiles concurrently from ONE process —
+    unlike a plain env var, which is process-global and would collapse
+    every multiplexed profile's guard-log entries onto whatever the
+    process happened to start with (verified live 2026-08-26,
+    HERMES-BOUND mission: a real ``hermes --profile fleet-overseer -z``
+    probe logged ``caller=hermes:default``, not
+    ``caller=hermes:fleet-overseer``, because HERMES_PROFILE /
+    HERMES_PROFILE_NAME are never actually exported as env vars by any
+    Hermes entry point — they were the wrong signal).
+
+    Falls back to the HERMES_PROFILE / HERMES_PROFILE_NAME env-var pair
+    (same precedence hermes_cli/runtime_provider.py reads for its own
+    diagnostics) only if the profiles-module lookup raises or is
+    unavailable — defense in depth, never the primary path. Never raises;
+    "default" if nothing resolves.
     """
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+        name = get_active_profile_name()
+        if name:
+            return name
+    except Exception:
+        pass
     return (
         os.environ.get("HERMES_PROFILE")
         or os.environ.get("HERMES_PROFILE_NAME")
