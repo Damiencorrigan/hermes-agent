@@ -25,8 +25,10 @@ Design:
 
 import json
 import logging
+import os
 import time
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Dict, Any, List, Optional, Tuple
@@ -65,6 +67,50 @@ MEMORY_BLOCK_HEADERS = {
 }
 
 ENTRY_DELIMITER = "\n§\n"
+
+
+# ---------------------------------------------------------------------------
+# No-silent-eviction rule (fleet constitution Article 5.1, 2026-08-26).
+#
+# Every removal of a memory fact must leave a visible record BEFORE the fact
+# leaves the store. Two records per eviction:
+#   - eviction_ledger.jsonl (JSON line: ts, target, action, content, protected)
+#   - an archive file (MEMORY.archive.md / USER.archive.md, or the configured
+#     override path) holding the evicted text
+# Both default to the profile's memories directory; config.yaml keys
+# ``memory.eviction_ledger_path`` / ``memory.eviction_archive_path`` can
+# override the paths (e.g. the commander profile archives into
+# honcho_profile.archive.md). ``memory.eviction_ledger_enabled`` /
+# ``memory.eviction_archive_enabled`` toggle each record (default: enabled).
+# ---------------------------------------------------------------------------
+
+def _load_eviction_settings() -> Dict[str, Any]:
+    """Read the eviction-record settings from config.yaml, fail-safe to enabled.
+
+    Kept as a module-level function so tests can monkeypatch it. Reads config
+    lazily per call: evictions are rare, and the memory dir may differ per
+    profile (HERMES_HOME), so nothing is cached at import time.
+    """
+    settings: Dict[str, Any] = {
+        "ledger_enabled": True,
+        "archive_enabled": True,
+        "ledger_path": None,
+        "archive_path": None,
+    }
+    try:
+        from hermes_cli.config import load_config
+
+        mem_cfg = (load_config() or {}).get("memory", {}) or {}
+        for key in ("eviction_ledger_enabled", "eviction_archive_enabled"):
+            if key in mem_cfg:
+                settings[key.removesuffix("_enabled") + "_enabled"] = bool(mem_cfg[key])
+        for key in ("eviction_ledger_path", "eviction_archive_path"):
+            value = mem_cfg.get(key)
+            if value:
+                settings[key] = str(value)
+    except Exception:
+        pass  # config is optional — never let record-keeping break a memory op
+    return settings
 
 
 # ---------------------------------------------------------------------------
@@ -376,6 +422,78 @@ class MemoryStore:
         else:
             self.memory_entries = entries
 
+    def _eviction_paths(self, target: str) -> tuple[Dict[str, Any], Path, Path]:
+        """Resolve ledger + archive paths for the current profile/target."""
+        settings = _load_eviction_settings()
+        mem_dir = get_memory_dir()
+        ledger = (
+            Path(settings["ledger_path"])
+            if settings.get("ledger_path")
+            else mem_dir / "eviction_ledger.jsonl"
+        )
+        archive = (
+            Path(settings["archive_path"])
+            if settings.get("archive_path")
+            else mem_dir / (("USER" if target == "user" else "MEMORY") + ".archive.md")
+        )
+        return settings, ledger, archive
+
+    def _record_eviction(
+        self,
+        target: str,
+        evictions: List[tuple[str, str]],
+    ) -> int:
+        """Record removed/replaced content BEFORE it leaves the store.
+
+        ``evictions`` is a list of ``(action, content)`` pairs where ``action``
+        is the mutation that evicted the content ("remove", "replace",
+        "batch-remove", "batch-replace"). Returns the number of ledger rows
+        written. Recording is best-effort: a ledger/archive write failure is
+        logged, never raised — a failed side effect must not break the memory
+        mutation itself, but the failure IS logged loudly (fail loud, rule 8).
+        """
+        if not evictions:
+            return 0
+        settings, ledger, archive = self._eviction_paths(target)
+        now = datetime.now(timezone.utc)
+        written = 0
+
+        if settings["ledger_enabled"]:
+            try:
+                ledger.parent.mkdir(parents=True, exist_ok=True)
+                with open(ledger, "a", encoding="utf-8") as f:
+                    for action, content in evictions:
+                        row = {
+                            "ts": now.isoformat(),
+                            "target": target,
+                            "action": action,
+                            "content": content,
+                            # target=user facts are Damien corrections —
+                            # flagged protected so downstream checks can treat
+                            # their eviction as a violation to review.
+                            "protected": target == "user",
+                        }
+                        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                        written += 1
+                    f.flush()
+                    os.fsync(f.fileno())
+            except (OSError, IOError) as exc:
+                logger.warning("eviction ledger write failed (%s): %s", ledger, exc)
+
+        if settings["archive_enabled"]:
+            try:
+                archive.parent.mkdir(parents=True, exist_ok=True)
+                with open(archive, "a", encoding="utf-8") as f:
+                    f.write(f"\n<!-- evicted {now.isoformat()} -->\n")
+                    for action, content in evictions:
+                        f.write(f"§ [{action}] {content}\n")
+                    f.flush()
+                    os.fsync(f.fileno())
+            except (OSError, IOError) as exc:
+                logger.warning("eviction archive write failed (%s): %s", archive, exc)
+
+        return written
+
     def _char_count(self, target: str) -> int:
         entries = self._entries_for(target)
         if not entries:
@@ -511,8 +629,12 @@ class MemoryStore:
                     "usage": f"{current:,}/{limit:,}",
                 })
 
+            old_entry = entries[idx]
             entries[idx] = new_content
             self._set_entries(target, entries)
+            # No-silent-eviction rule: the superseded fact is recorded before
+            # the new content hits disk.
+            self._record_eviction(target, [("replace", old_entry)])
             self.save_to_disk(target)
 
         return self._success_response(target, "Entry replaced.")
@@ -553,8 +675,11 @@ class MemoryStore:
                 # All identical -- safe to remove just the first
 
             idx = matches[0][0]
-            entries.pop(idx)
+            removed = entries.pop(idx)
             self._set_entries(target, entries)
+            # No-silent-eviction rule: record the fact BEFORE it leaves the
+            # store (the file write below is the actual removal).
+            self._record_eviction(target, [("remove", removed)])
             self.save_to_disk(target)
 
         return self._success_response(target, "Entry removed.")
@@ -595,6 +720,10 @@ class MemoryStore:
             # Work on a copy; only commit if the whole batch validates.
             working: List[str] = list(self._entries_for(target))
             limit = self._char_limit(target)
+            # Evicted (replaced/removed) content, recorded only at commit time
+            # so a rejected batch never writes ledger rows for facts that are
+            # still on disk.
+            evictions: List[tuple[str, str]] = []
 
             for i, op in enumerate(operations):
                 op = op or {}
@@ -626,6 +755,7 @@ class MemoryStore:
                             target,
                             f"{pos}: '{old_text}' matched multiple distinct entries -- be more specific.",
                         )
+                    evictions.append(("batch-replace", working[matches[0]]))
                     working[matches[0]] = content
 
                 elif act == "remove":
@@ -639,6 +769,7 @@ class MemoryStore:
                             target,
                             f"{pos}: '{old_text}' matched multiple distinct entries -- be more specific.",
                         )
+                    evictions.append(("batch-remove", working[matches[0]]))
                     working.pop(matches[0])
 
                 else:
@@ -664,6 +795,9 @@ class MemoryStore:
 
             # Commit.
             self._set_entries(target, working)
+            # No-silent-eviction rule: record evicted facts before they leave
+            # the store on disk.
+            self._record_eviction(target, evictions)
             self.save_to_disk(target)
 
         return self._success_response(target, f"Applied {len(operations)} operation(s).")
