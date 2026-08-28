@@ -7,6 +7,7 @@ proved gone. Terminal states are immutable.
 
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 import threading
@@ -29,6 +30,7 @@ MAX_TERMINAL_EXECUTIONS = 1000
 _TERMINAL_STATES = ("completed", "failed", "unknown")
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
+logger = logging.getLogger(__name__)
 
 
 def _resolve_executions_file() -> Path:
@@ -178,9 +180,19 @@ def _owner_is_live(pid: int, started_at: Optional[int]) -> bool:
     return current is not None and current == started_at
 
 
-def _prune_unlocked(conn: sqlite3.Connection) -> None:
+def _prune_unlocked(conn: sqlite3.Connection) -> int:
+    """Rotate terminal history; return the number of rows evicted.
+
+    The retention cap is a rotating window, never a hard stop: the newest
+    ``MAX_TERMINAL_EXECUTIONS`` terminal rows are kept and any older surplus
+    is windowed away, so the next execution always records. Non-terminal rows
+    ('claimed'/'running') are live attempts and are never counted or evicted.
+    Rotation also runs on the create path so an over-cap store (e.g. one left
+    pinned at the cap by an older writer) self-trims on its next write instead
+    of refusing new records.
+    """
     limit = max(0, int(MAX_TERMINAL_EXECUTIONS))
-    conn.execute(
+    cur = conn.execute(
         """DELETE FROM executions WHERE id IN (
              SELECT id FROM executions
              WHERE status IN ('completed','failed','unknown')
@@ -188,6 +200,15 @@ def _prune_unlocked(conn: sqlite3.Connection) -> None:
            )""",
         (limit,),
     )
+    evicted = cur.rowcount
+    if evicted:
+        logger.info(
+            "cron execution ledger rotated: evicted %d terminal execution(s), "
+            "retention cap %d",
+            evicted,
+            limit,
+        )
+    return evicted
 
 
 def create_execution(job_id: str, *, source: str) -> Dict[str, Any]:
@@ -204,6 +225,7 @@ def create_execution(job_id: str, *, source: str) -> Dict[str, Any]:
             (execution_id, str(job_id), str(source), _PROCESS_ID, pid,
              _process_start_time(pid), now),
         )
+        _prune_unlocked(conn)
         row = conn.execute(
             "SELECT * FROM executions WHERE id=?", (execution_id,)
         ).fetchone()
