@@ -266,6 +266,16 @@ def dgx_request_guard(agent, api_kwargs: dict):
 
     guard = _load_guard_module()
     cfg = guard.load_config()
+    # P210 (2026-08-30): demand-side clamp runs HERE, before the slot is
+    # even requested — the only gate every :30000 request passes. Injects
+    # max_thinking_tokens (bounded reasoning; the unbounded-thinking tail
+    # is the last remaining flap class) and rejects over-prefill requests
+    # with guard.DGXDemandClampRejected (4xx-equivalent). Mutates
+    # api_kwargs in place so the request that actually goes out carries the
+    # cap. No-op (one config lookup) when dgx.demand_clamp.enabled=false.
+    guard.clamp_dgx_request(
+        api_kwargs, config=cfg, caller_label=f"hermes:{_profile_name()}"
+    )
     tokens = estimate_prompt_tokens(api_kwargs)
     is_big = tokens > cfg.big_prompt_token_threshold
     timeout_s = BIG_PROMPT_WAIT_TIMEOUT_S if is_big else WORKER_WAIT_TIMEOUT_S
