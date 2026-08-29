@@ -4290,6 +4290,31 @@ def _is_unsupported_temperature_error(exc: Exception) -> bool:
     return _is_unsupported_parameter_error(exc, "temperature")
 
 
+def _is_unsupported_response_format_error(exc: Exception) -> bool:
+    """Detect provider 400s that reject a structured ``response_format``.
+
+    Callers that force ``{"type": "json_schema", ...}`` (title_generation's
+    ``_TITLE_RESPONSE_FORMAT``, P131) need a provider-agnostic escape hatch:
+    the phrasing varies and doesn't match :func:`_is_unsupported_parameter_error`'s
+    marker list (no "unsupported"/"not supported" wording). Verified against
+    DeepSeek's api.deepseek.com, which 400s any ``json_schema`` request with
+    exactly this text regardless of prompt content (2026-08-29, curl-verified):
+    ``This response_format type is unavailable now``. Also matches the more
+    conventional "response_format ... not supported" phrasing other providers use.
+    """
+    err_lower = str(exc).lower()
+    if "response_format" not in err_lower and "response format" not in err_lower:
+        return False
+    return any(marker in err_lower for marker in (
+        "unavailable",
+        "not supported",
+        "does not support",
+        "unsupported",
+        "unknown parameter",
+        "invalid parameter",
+    ))
+
+
 def _is_model_not_found_error(exc: Exception) -> bool:
     """Detect "the requested model doesn't exist" errors (404 / invalid model).
 
@@ -5056,6 +5081,48 @@ def _call_fallback_candidate_sync(
             task,
         )
     except Exception as fb_err:
+        # ── Structured-output rejection (P131) ──────────────────────
+        # A fallback candidate can reject the caller's forced
+        # extra_body.response_format even when the primary provider
+        # accepts it — verified against api.deepseek.com, which 400s any
+        # json_schema request with "This response_format type is
+        # unavailable now" regardless of prompt content. Strip and retry
+        # once on this candidate before moving on: the caller's own
+        # parsing (e.g. title_generator._extract_title_text's loose-JSON
+        # / prose fallback) already tolerates a provider that ignores
+        # response_format.
+        if (
+            isinstance(fb_kwargs.get("extra_body"), dict)
+            and "response_format" in fb_kwargs["extra_body"]
+            and _is_unsupported_response_format_error(fb_err)
+        ):
+            retry_fb_kwargs = dict(fb_kwargs)
+            retry_extra_body = dict(retry_fb_kwargs["extra_body"])
+            retry_extra_body.pop("response_format", None)
+            if retry_extra_body:
+                retry_fb_kwargs["extra_body"] = retry_extra_body
+            else:
+                retry_fb_kwargs.pop("extra_body", None)
+            logger.info(
+                "Auxiliary %s: fallback candidate %s rejected response_format; "
+                "retrying once without it",
+                task or "call", fb_label,
+            )
+            try:
+                return _validate_llm_response(
+                    _relay_sync_completion(
+                        fb_client,
+                        retry_fb_kwargs,
+                        provider=destination.provider,
+                        api_mode=destination.api_mode,
+                    ),
+                    task,
+                )
+            except Exception as retry_fb_err:
+                if not _is_auth_error(retry_fb_err):
+                    raise
+                fb_err = retry_fb_err
+                fb_kwargs = retry_fb_kwargs
         if not _is_auth_error(fb_err):
             raise
         fb_provider = _auth_refresh_provider_for_route(
@@ -5162,6 +5229,43 @@ async def _call_fallback_candidate_async(
             task,
         )
     except Exception as fb_err:
+        # ── Structured-output rejection (P131) ──────────────────────
+        # Async mirror of the sync candidate's handling — see there for
+        # the rationale (deepseek 400s json_schema with "This
+        # response_format type is unavailable now" regardless of prompt
+        # content). Strip and retry once on this candidate before moving on.
+        if (
+            isinstance(fb_kwargs.get("extra_body"), dict)
+            and "response_format" in fb_kwargs["extra_body"]
+            and _is_unsupported_response_format_error(fb_err)
+        ):
+            retry_fb_kwargs = dict(fb_kwargs)
+            retry_extra_body = dict(retry_fb_kwargs["extra_body"])
+            retry_extra_body.pop("response_format", None)
+            if retry_extra_body:
+                retry_fb_kwargs["extra_body"] = retry_extra_body
+            else:
+                retry_fb_kwargs.pop("extra_body", None)
+            logger.info(
+                "Auxiliary %s (async): fallback candidate %s rejected response_format; "
+                "retrying once without it",
+                task or "call", fb_label,
+            )
+            try:
+                return _validate_llm_response(
+                    await _relay_async_completion(
+                        fb_client,
+                        retry_fb_kwargs,
+                        provider=destination.provider,
+                        api_mode=destination.api_mode,
+                    ),
+                    task,
+                )
+            except Exception as retry_fb_err:
+                if not _is_auth_error(retry_fb_err):
+                    raise
+                fb_err = retry_fb_err
+                fb_kwargs = retry_fb_kwargs
         if not _is_auth_error(fb_err):
             raise
         fb_provider = _auth_refresh_provider_for_route(
@@ -9414,6 +9518,48 @@ def _call_llm_impl(
                     raise
                 first_err = retry_err
 
+        # ── Structured-output rejection (P131) ──────────────────────────
+        # A caller forced ``extra_body.response_format`` (title_generation's
+        # json_schema constraint is the current example) but the resolved
+        # provider doesn't currently honor that response_format type — verified
+        # against api.deepseek.com, which 400s any json_schema request with
+        # "This response_format type is unavailable now" independent of prompt
+        # content. Strip it and retry once rather than raising: the caller's
+        # own parsing (title_generator._extract_title_text's loose-JSON /
+        # prose fallback) already tolerates a provider that ignores
+        # response_format, so a plain completion is still usable.
+        if "extra_body" in kwargs and isinstance(kwargs["extra_body"], dict) and \
+                "response_format" in kwargs["extra_body"] and \
+                _is_unsupported_response_format_error(first_err):
+            retry_kwargs = dict(kwargs)
+            retry_extra_body = dict(retry_kwargs["extra_body"])
+            retry_extra_body.pop("response_format", None)
+            if retry_extra_body:
+                retry_kwargs["extra_body"] = retry_extra_body
+            else:
+                retry_kwargs.pop("extra_body", None)
+            logger.info(
+                "Auxiliary %s: provider rejected response_format; retrying once without it",
+                task or "call",
+            )
+            try:
+                return _validate_llm_response(
+                    _relay_sync_completion(
+                        client,
+                        retry_kwargs,
+                        provider=resolved_provider,
+                        api_mode=resolved_api_mode,
+                    ), task)
+            except Exception as retry_err:
+                if not (
+                    _is_payment_error(retry_err)
+                    or _is_connection_error(retry_err)
+                    or _is_rate_limit_error(retry_err)
+                ):
+                    raise
+                first_err = retry_err
+                kwargs = retry_kwargs
+
         # ── Stale-model self-heal (Nous Portal recommendation drift) ───
         # A long-lived process can pin a Portal-recommended model that has
         # since been dropped from the Nous → OpenRouter catalog, so every
@@ -10125,6 +10271,44 @@ async def _async_call_llm_impl(
                 if not (_is_payment_error(retry_err) or _is_connection_error(retry_err) or _is_rate_limit_error(retry_err)):
                     raise
                 first_err = retry_err
+
+        # ── Structured-output rejection (P131) ──────────────────────────
+        # See the sync call_llm() path for the rationale: a caller forced
+        # extra_body.response_format (title_generation's json_schema is the
+        # current example) but the resolved provider rejects that response_format
+        # type (verified against api.deepseek.com — "This response_format type
+        # is unavailable now" regardless of prompt content). Strip and retry once.
+        if "extra_body" in kwargs and isinstance(kwargs["extra_body"], dict) and \
+                "response_format" in kwargs["extra_body"] and \
+                _is_unsupported_response_format_error(first_err):
+            retry_kwargs = dict(kwargs)
+            retry_extra_body = dict(retry_kwargs["extra_body"])
+            retry_extra_body.pop("response_format", None)
+            if retry_extra_body:
+                retry_kwargs["extra_body"] = retry_extra_body
+            else:
+                retry_kwargs.pop("extra_body", None)
+            logger.info(
+                "Auxiliary %s (async): provider rejected response_format; retrying once without it",
+                task or "call",
+            )
+            try:
+                return _validate_llm_response(
+                    await _relay_async_completion(
+                        client,
+                        retry_kwargs,
+                        provider=resolved_provider,
+                        api_mode=resolved_api_mode,
+                    ), task)
+            except Exception as retry_err:
+                if not (
+                    _is_payment_error(retry_err)
+                    or _is_connection_error(retry_err)
+                    or _is_rate_limit_error(retry_err)
+                ):
+                    raise
+                first_err = retry_err
+                kwargs = retry_kwargs
 
         # ── Stale-model self-heal (Nous Portal recommendation drift) ───
         # See the sync call_llm() path for the rationale: a long-lived process

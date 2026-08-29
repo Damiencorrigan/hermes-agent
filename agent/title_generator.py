@@ -58,6 +58,18 @@ RuntimeValidator = Callable[[], bool]
 # a pasted stack trace.
 MAX_TITLE_INPUT_CHARS = 1000
 
+# Hard per-call ceiling for the title-generation LLM upgrade (P79).
+# A session title is cosmetic: the cheap local template (``derive_title``)
+# is already persisted inline by ``apply_instant_title`` BEFORE this upgrade
+# thread runs, so a failed or aborted upgrade costs nothing functionally.
+# The aux fallback ladder used to burn the configured task timeout (30s)
+# twice per turn on a saturated lane (~90s of wall clock per title call,
+# ~45 min of every 60-min prompt-port budget), then exhaust every fallback
+# and return empty anyway. Cap the upgrade so it fails fast and the derived
+# title simply stands. Config timeouts above the cap are clamped, never
+# extended.
+_TITLE_TIMEOUT_CAP = 10.0
+
 # Cap on the instant derived title. Deliberately shorter than the model's
 # budget: a raw sentence fragment reads worse the longer it runs. Cline and
 # Codex CLI independently landed on the same ~50-char slice.
@@ -390,6 +402,24 @@ def generate_title(
         {"role": "system", "content": prompt},
         {"role": "user", "content": user_snippet},
     ]
+
+    # Hard cap the upgrade call (see _TITLE_TIMEOUT_CAP). The derived title
+    # is already on the session; the model call is an optional polish that
+    # must never hold a saturated lane or a cron budget hostage. Callers have
+    # passed string timeouts positionally, so coerce; an unparseable or
+    # oversized value falls back to the cap.
+    if timeout is not None:
+        try:
+            timeout = float(timeout)
+        except (TypeError, ValueError):
+            timeout = _TITLE_TIMEOUT_CAP
+    if timeout is None or timeout > _TITLE_TIMEOUT_CAP:
+        if timeout is not None:
+            logger.debug(
+                "Title generation timeout %.1fs clamped to hard cap %.1fs",
+                timeout, _TITLE_TIMEOUT_CAP,
+            )
+        timeout = _TITLE_TIMEOUT_CAP
 
     try:
         response = call_llm(

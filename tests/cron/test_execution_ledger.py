@@ -510,3 +510,76 @@ class TestExecutionsFileMultiplexScoping:
         record = executions.create_execution("job-compat", source="builtin")
         assert custom.exists()
         assert executions.list_executions(job_id="job-compat")[0]["id"] == record["id"]
+
+
+def test_1001st_execution_is_retained_and_oldest_is_evicted(monkeypatch, tmp_path):
+    """The retention cap is a rotating window, not a hard stop.
+
+    Regression for the 2026-08-26 incident: executions.db pinned at exactly
+    1000 terminal rows and recording stopped. After this test, the 1001st
+    execution is recorded and the OLDEST terminal row is evicted instead of
+    the ledger refusing new records.
+    """
+    executions = _point_ledger(monkeypatch, tmp_path)
+    monkeypatch.setattr(executions, "MAX_TERMINAL_EXECUTIONS", 1000)
+
+    oldest = executions.create_execution("oldest-job", source="builtin")
+    executions.finish_execution(oldest["id"], success=True)
+
+    for index in range(999):
+        row = executions.create_execution(f"filler-{index}", source="builtin")
+        executions.finish_execution(row["id"], success=True)
+
+    # The 1001st execution: full claimed -> running -> completed lifecycle.
+    claim = executions.create_execution("number-1001", source="builtin")
+    executions.mark_execution_running(claim["id"])
+    done = executions.finish_execution(claim["id"], success=True)
+    assert done["status"] == "completed"
+
+    conn = sqlite3.connect(executions.EXECUTIONS_FILE)
+    try:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT id, status FROM executions").fetchall()
+    finally:
+        conn.close()
+
+    assert len(rows) == 1000
+    ids = {row["id"] for row in rows}
+    assert claim["id"] in ids  # 1001st retained
+    assert oldest["id"] not in ids  # oldest evicted
+
+
+def test_create_path_self_heals_over_cap_store(monkeypatch, tmp_path):
+    """A store left over the cap by an older writer trims on the next write;
+    create_execution never refuses to record at the cap."""
+    executions = _point_ledger(monkeypatch, tmp_path)
+
+    monkeypatch.setattr(executions, "MAX_TERMINAL_EXECUTIONS", 10**9)
+    for index in range(1050):
+        row = executions.create_execution(f"seed-{index}", source="builtin")
+        executions.finish_execution(row["id"], success=True)
+    monkeypatch.setattr(executions, "MAX_TERMINAL_EXECUTIONS", 1000)
+
+    claim = executions.create_execution("resumed", source="builtin")
+    assert claim["status"] == "claimed"
+
+    conn = sqlite3.connect(executions.EXECUTIONS_FILE)
+    try:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT id, job_id, status FROM executions"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    assert len(rows) == 1001  # 1000 terminal + the new claimed attempt
+    ids = {row["id"] for row in rows}
+    job_ids = {row["job_id"] for row in rows}
+    assert claim["id"] in ids
+    assert "resumed" in job_ids
+    terminal = [
+        row for row in rows if row["status"] in ("completed", "failed", "unknown")
+    ]
+    assert len(terminal) == 1000
+    # The 50 oldest seeded rows were evicted on the resume write.
+    assert all(f"seed-{index}" not in job_ids for index in range(50))

@@ -30,21 +30,57 @@ class TestGenerateTitle:
          patch("hermes_cli.config.load_config_readonly", side_effect=RuntimeError("bad config")):
             assert _title_language() == ""
 
-    def test_default_timeout_delegates_to_auxiliary_config(self):
+    def test_default_timeout_capped_at_hard_ceiling(self):
+        """P79: the title upgrade must never burn the configured 30s aux
+        timeout twice per turn on a saturated lane. With no explicit timeout
+        the call must carry the hard cap (<=10s), not None (which defers to
+        the task config's 30s). The derived title is already persisted inline,
+        so failing fast costs nothing."""
         captured_kwargs = {}
 
         def mock_call_llm(**kwargs):
             captured_kwargs.update(kwargs)
             resp = MagicMock()
             resp.choices = [MagicMock()]
-            resp.choices[0].message.content = "Configured Timeout"
+            resp.choices[0].message.content = "Capped Timeout"
             return resp
 
         with patch("agent.title_generator.call_llm", side_effect=mock_call_llm):
-            assert generate_title("question") == "Configured Timeout"
+            assert generate_title("question") == "Capped Timeout"
 
         assert captured_kwargs["task"] == "title_generation"
-        assert captured_kwargs["timeout"] is None
+        assert captured_kwargs["timeout"] is not None
+        assert captured_kwargs["timeout"] <= 10.0
+
+    def test_explicit_timeout_below_cap_is_preserved(self):
+        captured_kwargs = {}
+
+        def mock_call_llm(**kwargs):
+            captured_kwargs.update(kwargs)
+            resp = MagicMock()
+            resp.choices = [MagicMock()]
+            resp.choices[0].message.content = "Short Timeout"
+            return resp
+
+        with patch("agent.title_generator.call_llm", side_effect=mock_call_llm):
+            generate_title("question", timeout=5.0)
+
+        assert captured_kwargs["timeout"] == 5.0
+
+    def test_explicit_timeout_above_cap_is_clamped(self):
+        captured_kwargs = {}
+
+        def mock_call_llm(**kwargs):
+            captured_kwargs.update(kwargs)
+            resp = MagicMock()
+            resp.choices = [MagicMock()]
+            resp.choices[0].message.content = "Clamped Timeout"
+            return resp
+
+        with patch("agent.title_generator.call_llm", side_effect=mock_call_llm):
+            generate_title("question", timeout=30.0)
+
+        assert captured_kwargs["timeout"] <= 10.0
 
 
 
