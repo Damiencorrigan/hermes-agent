@@ -133,14 +133,36 @@ def fake_ai_fleet(tmp_path, monkeypatch):
         class DGXContextGuardTimeoutError(RuntimeError):
             pass
 
+        class DGXDemandClampRejected(RuntimeError):
+            pass
+
         class _Cfg:
             def __init__(self):
                 self.max_concurrent_workers = 6
                 self.max_concurrent_big_prompt = 2
                 self.big_prompt_token_threshold = 80_000
+                self.demand_clamp_enabled = False
+                self.max_thinking_tokens = 8192
+                self.max_prefill_tokens = 120_000
+
+        _CFG = _Cfg()
 
         def load_config():
-            return _Cfg()
+            return _CFG
+
+        def clamp_dgx_request(payload, config=None, caller_label="fleet_router"):
+            # Minimal stand-in for the real P210 clamp
+            # (ops/dgx_context_guard in the real ai-fleet checkout): honours
+            # the enabled flag and the prefill rail so the wrapper's call
+            # contract is testable without importing the live guard.
+            cfg = config or load_config()
+            if not cfg.demand_clamp_enabled:
+                return payload
+            est = len(str(payload)) // 4
+            if est > cfg.max_prefill_tokens:
+                raise DGXDemandClampRejected("replay: over prefill rail")
+            payload.setdefault("max_thinking_tokens", cfg.max_thinking_tokens)
+            return payload
 
         @contextlib.contextmanager
         def dgx_slot(prompt_tokens, config=None, timeout_s=None, caller_label="fleet_router"):
@@ -216,6 +238,35 @@ class TestDgxRequestGuard:
         guard = m._load_guard_module()
         assert guard.calls[0]["caller_label"] == "hermes:default"
 
+    def test_demand_clamp_injects_thinking_cap_when_enabled(self, fake_ai_fleet, monkeypatch):
+        # P210: the wrapper must call guard.clamp_dgx_request on api_kwargs
+        # before the slot, so the request that actually goes out carries the
+        # thinking cap. The fake guard honours demand_clamp_enabled.
+        monkeypatch.delenv("HERMES_DGX_GUARD_HOSTS", raising=False)
+        import hermes_cli.profiles as profiles_mod
+        monkeypatch.setattr(profiles_mod, "get_active_profile_name", lambda: "commander")
+        m = fake_ai_fleet
+        guard = m._load_guard_module()
+        guard.load_config().demand_clamp_enabled = True
+        agent = SimpleNamespace(base_url="http://192.168.0.214:30000/v1")
+        api_kwargs = {"messages": [{"role": "user", "content": "hi"}], "tools": []}
+        with m.dgx_request_guard(agent, api_kwargs):
+            pass
+        assert api_kwargs.get("max_thinking_tokens") == 8192
+
+    def test_demand_clamp_noop_when_disabled(self, fake_ai_fleet, monkeypatch):
+        monkeypatch.delenv("HERMES_DGX_GUARD_HOSTS", raising=False)
+        import hermes_cli.profiles as profiles_mod
+        monkeypatch.setattr(profiles_mod, "get_active_profile_name", lambda: "commander")
+        m = fake_ai_fleet
+        guard = m._load_guard_module()
+        guard.load_config().demand_clamp_enabled = False
+        agent = SimpleNamespace(base_url="http://192.168.0.214:30000/v1")
+        api_kwargs = {"messages": [{"role": "user", "content": "hi"}], "tools": []}
+        with m.dgx_request_guard(agent, api_kwargs):
+            pass
+        assert "max_thinking_tokens" not in api_kwargs
+
 
 class TestProfileNameResolution:
     """_profile_name() prefers hermes_cli.profiles.get_active_profile_name()
@@ -277,9 +328,15 @@ class TestProfileNameResolution:
                     self.max_concurrent_workers = 6
                     self.max_concurrent_big_prompt = 2
                     self.big_prompt_token_threshold = 80_000
+                    self.demand_clamp_enabled = False
+                    self.max_thinking_tokens = 8192
+                    self.max_prefill_tokens = 120_000
 
             def load_config():
                 return _Cfg()
+
+            def clamp_dgx_request(payload, config=None, caller_label="fleet_router"):
+                return payload
 
             @contextlib.contextmanager
             def dgx_slot(prompt_tokens, config=None, timeout_s=None, caller_label="fleet_router"):
