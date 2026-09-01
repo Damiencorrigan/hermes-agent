@@ -872,6 +872,14 @@ _SPEND_GUARD_SNIPPET = (
     "sys.path.insert(0, sys.argv[1]); import spend_guard; "
     "print(json.dumps(spend_guard.lane_blocked(Path(sys.argv[1]), sys.argv[2])))"
 )
+# litellm_caps hard-cap PARK (2026-09-01): ops/litellm_caps.py enforce writes
+# lane_failover.json when deepseek balance <= $0.5 OR daily spend >= $20 —
+# the FLEET-WIDE hard cap, separate from the per-lane spend_caps.json limits.
+# The gate must refuse on EITHER signal; the per-lane cap alone was blind to
+# a fleet-wide burn (measured 2026-09-01: $24.78 >= $20 parked while the
+# hermes-deepseek lane read $2.67 under its $5 cap — a hermes-direct call
+# sailed through). Read at call time; unreadable park file = fail-closed.
+_FAILOVER_STATE_PATH = _SPEND_GUARD_FLEET_ROOT / "ops" / "state" / "lane_failover.json"
 # Provider -> ledger lane. spend_guard counts the lane named in
 # bench/spend_caps.json (hermes-deepseek $5/day; deepseek $8/day). A provider
 # absent here is not capped (local/DGX/Claude-Max $0 lanes, unlisted cloud).
@@ -903,6 +911,19 @@ def _primary_lane_cap_reason(lane: str) -> Optional[str]:
     routing test. Production never sets it; a missing guard refuses."""
     if os.environ.get("HERMES_SPEND_GUARD_OFF") == "1":
         return None
+    # HARD-CAP PARK first (litellm_caps lane_failover.json) — a fleet-wide
+    # burn parks deepseek even when this lane is under its own cap. This is
+    # the LIVE over-cap signal (measured 2026-09-01: $24.78 >= $20 while
+    # hermes-deepseek read $2.67). Unreadable park = fail-closed.
+    try:
+        if _FAILOVER_STATE_PATH.exists():
+            park = json.loads(_FAILOVER_STATE_PATH.read_text(encoding="utf-8"))
+            ds = (park.get("lanes") or {}).get("deepseek", {})
+            if ds.get("parked"):
+                return (f"hard_cap_parked:{ds.get('reason', 'deepseek parked')} "
+                        f"(lane_failover.json {park.get('ts', '?')})")
+    except Exception as exc:
+        return f"hard_cap_unreadable:{type(exc).__name__}"
     guard = _SPEND_GUARD_FLEET_ROOT / "spend_guard.py"
     if not guard.is_file():
         return f"spend_guard_missing:{guard}"
