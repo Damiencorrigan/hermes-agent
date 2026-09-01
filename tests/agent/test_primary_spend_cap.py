@@ -15,6 +15,7 @@ the enforcing half:
     FailoverReason.billing (retry stops, fuse-gated fallback takes over).
 """
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -33,6 +34,10 @@ def _guard_root(tmp_path, monkeypatch):
     monkeypatch.delenv("HERMES_SPEND_GUARD_OFF", raising=False)
     guard_dir = tmp_path / "ai-fleet"
     guard_dir.mkdir()
+    # the hard-cap park file must live under the SAME temp root (no real
+    # HOME park may leak into these tests)
+    monkeypatch.setattr(h, "_FAILOVER_STATE_PATH",
+                        guard_dir / "ops" / "state" / "lane_failover.json")
     (guard_dir / "spend_guard.py").write_text(
         "import sys, json\n"
         "def lane_blocked(repo_root, lane, cfg=None, **kw):\n"
@@ -102,6 +107,14 @@ def test_missing_guard_fails_CLOSED(tmp_path, monkeypatch):
 
 def test_streaming_and_nonstreaming_entries_both_gate(tmp_path, monkeypatch):
     """Both chat-completion entry points call the gate."""
+    # cost mode must be off for this test (the real cost_mode.json is mode 3
+    # which preempts with CostSavingModeBlocked before the cap is reached —
+    # correct production behavior, but it would mask the cap assertion here)
+    import agent.cost_mode as cm
+    monkeypatch.setattr(cm, "COST_MODE_FILE", tmp_path / "cost_mode_off.json")
+    (tmp_path / "cost_mode_off.json").write_text(
+        json.dumps({"mode": "off", "set_by": "test"}), encoding="utf-8")
+    cm._reset_cache_for_tests()
     calls = []
     real = h.enforce_primary_spend_cap
     monkeypatch.setattr(h, "enforce_primary_spend_cap",
