@@ -917,7 +917,7 @@ def _primary_lane_cap_reason(lane: str) -> Optional[str]:
     # hermes-deepseek read $2.67). Unreadable park = fail-closed.
     try:
         if _FAILOVER_STATE_PATH.exists():
-            park = json.loads(_FAILOVER_STATE_PATH.read_text())
+            park = json.loads(_FAILOVER_STATE_PATH.read_text(encoding="utf-8"))
             ds = (park.get("lanes") or {}).get("deepseek", {})
             if ds.get("parked"):
                 return (f"hard_cap_parked:{ds.get('reason', 'deepseek parked')} "
