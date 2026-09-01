@@ -27,7 +27,10 @@ OLLAMA = SimpleNamespace(provider="ollama", model="qwen2.5:14b")
 
 @pytest.fixture(autouse=True)
 def _guard_root(tmp_path, monkeypatch):
-    """Point the gate at a temp ai-fleet root with a fake spend_guard."""
+    """Point the gate at a temp ai-fleet root with a fake spend_guard, and
+    UNDO the hermetic escape hatch (conftest sets HERMES_SPEND_GUARD_OFF=1
+    for sandboxed tests — these tests exist to prove the gate ACTIVE)."""
+    monkeypatch.delenv("HERMES_SPEND_GUARD_OFF", raising=False)
     guard_dir = tmp_path / "ai-fleet"
     guard_dir.mkdir()
     (guard_dir / "spend_guard.py").write_text(

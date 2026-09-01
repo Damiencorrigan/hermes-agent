@@ -468,6 +468,14 @@ def _hermetic_environment(tmp_path, monkeypatch):
     (fake_hermes_home / "skills").mkdir()
     monkeypatch.setenv("HERMES_HOME", str(fake_hermes_home))
 
+    # 3a. The primary spend cap (agent/chat_completion_helpers.py) consults
+    #     ~/ai-fleet/spend_guard.py — absent in CI and sandboxed tests. The
+    #     gate's fail-closed-on-missing would brick every routing test, so
+    #     sandboxed tests set the documented test-only escape hatch. Real
+    #     production sessions never see this (their HERMES_HOME is the real
+    #     root, not a tempdir) — the gate stays fail-closed there.
+    monkeypatch.setenv("HERMES_SPEND_GUARD_OFF", "1")
+
     # 3b. hermes_state computes ``DEFAULT_DB_PATH = get_hermes_home() / "state.db"``
     #     at import time. When the module is first imported at collection (any
     #     test file with a top-level ``from hermes_state import ...``) that

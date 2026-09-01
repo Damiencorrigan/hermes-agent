@@ -895,7 +895,14 @@ class PrimarySpendCapExceeded(Exception):
 
 def _primary_lane_cap_reason(lane: str) -> Optional[str]:
     """Skip reason when ``lane`` is over cap today, else None. Fail-closed:
-    a guard that cannot be read returns a reason (refuse), never permission."""
+    a guard that cannot be read returns a reason (refuse), never permission.
+
+    Test escape hatch: ``HERMES_SPEND_GUARD_OFF=1`` (set by tests/conftest.py
+    when HERMES_HOME is sandboxed) makes the gate a no-op — CI and unit tests
+    have no ~/ai-fleet checkout, and refusing there would brick every
+    routing test. Production never sets it; a missing guard refuses."""
+    if os.environ.get("HERMES_SPEND_GUARD_OFF") == "1":
+        return None
     guard = _SPEND_GUARD_FLEET_ROOT / "spend_guard.py"
     if not guard.is_file():
         return f"spend_guard_missing:{guard}"
