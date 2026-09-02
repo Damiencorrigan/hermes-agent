@@ -26,6 +26,8 @@ import sys
 import threading
 import time
 import uuid
+from datetime import date
+
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
@@ -880,6 +882,49 @@ _SPEND_GUARD_SNIPPET = (
 # hermes-deepseek lane read $2.67 under its $5 cap — a hermes-direct call
 # sailed through). Read at call time; unreadable park file = fail-closed.
 _FAILOVER_STATE_PATH = _SPEND_GUARD_FLEET_ROOT / "ops" / "state" / "lane_failover.json"
+# L10 FAIL-CLOSED day-total hard cap (2026-09-02 Damien directive
+# spend-cap-failclosed: "hard cap must physically block calls, not just
+# report"). The $20 hard cap is ACCOUNT-wide: the DeepSeek day total is the
+# sum of fleet_router rows + dsh-harness balance-delta rows + hermes rows on
+# ONE physical account. On 2026-09-02 the ledger crossed $20.82 at 16:54
+# (dsh-harness sentinel row) but the hourly park only landed at 17:54, and
+# spend_guard's per-lane caps read hermes-deepseek ~$1.73 under its $5 — so
+# NOTHING refused at request time while the account kept spending. This gate
+# therefore ALSO denies deterministically from the LEDGER itself at call
+# time: today's bench/daily_spend.jsonl total >= $20 -> refuse; ledger
+# missing/unreadable -> refuse (cannot prove the cap open). Mirror of
+# ops/litellm_caps.ledger_spend_today() with an ABSOLUTE state path (R57d
+# lesson: hermes-agent cannot import ai-fleet ops). Keep _HARD_CAP_DAY_USD
+# in lockstep with litellm_caps.HARD_DAILY_USD.
+_HARD_CAP_DAY_LEDGER = Path.home() / "ai-fleet" / "bench" / "daily_spend.jsonl"
+_HARD_CAP_DAY_USD = 20.0
+
+
+def _hard_cap_day_total_usd() -> Optional[float]:
+    """Today's DeepSeek-account ledger total (USD) straight from the ONE
+    ledger (bench/daily_spend.jsonl — every row for the LOCAL day, including
+    the dsh-harness balance-delta rows the hourly sentinel appends).
+
+    None when the ledger is missing or unreadable, so the caller decides the
+    failure posture: the request-time gate treats None as fail-CLOSED
+    (refuse the paid call). Mirrors ops/litellm_caps.ledger_spend_today()."""
+    try:
+        if not _HARD_CAP_DAY_LEDGER.is_file():
+            return None
+        today = date.today().isoformat()
+        total = 0.0
+        for line in _HARD_CAP_DAY_LEDGER.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            if row.get("day") == today:
+                total += float(row.get("cost_usd") or 0.0)
+        return round(total, 6)
+    except Exception:
+        return None
+
+
 # Provider -> ledger lane. spend_guard counts the lane named in
 # bench/spend_caps.json (hermes-deepseek $5/day; deepseek $8/day). A provider
 # absent here is not capped (local/DGX/Claude-Max $0 lanes, unlisted cloud).
@@ -924,6 +969,18 @@ def _primary_lane_cap_reason(lane: str) -> Optional[str]:
                         f"(lane_failover.json {park.get('ts', '?')})")
     except Exception as exc:
         return f"hard_cap_unreadable:{type(exc).__name__}"
+    # L10 DAY-TOTAL hard cap (2026-09-02): refuse at CALL time from the live
+    # ledger — the hourly park above can lag the ledger by up to an hour (it
+    # did on 2026-09-02: ledger crossed $20.82 at 16:54, park landed 17:54),
+    # and the per-lane spend_guard check below is blind to the dsh-harness
+    # residual bucket. >= $20 OR unreadable ledger -> refuse (fail-closed).
+    day_total = _hard_cap_day_total_usd()
+    if day_total is None:
+        return (f"hard_cap_day_ledger_unreadable:{_HARD_CAP_DAY_LEDGER} — "
+                f"cannot prove the $20/day hard cap is open (L10 fail-closed)")
+    if day_total >= _HARD_CAP_DAY_USD:
+        return (f"hard_cap_day_total:${day_total:.2f} >= ${_HARD_CAP_DAY_USD:.2f} "
+                f"day-total hard cap from the live ledger (L10 fail-closed)")
     guard = _SPEND_GUARD_FLEET_ROOT / "spend_guard.py"
     if not guard.is_file():
         return f"spend_guard_missing:{guard}"

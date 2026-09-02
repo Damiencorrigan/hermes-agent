@@ -16,6 +16,7 @@ the enforcing half:
 """
 
 import json
+from datetime import date, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -52,6 +53,16 @@ def _guard_root(tmp_path, monkeypatch):
         encoding="utf-8",
     )
     monkeypatch.setattr(h, "_SPEND_GUARD_FLEET_ROOT", guard_dir)
+    # L10 day-total hard cap (2026-09-02): point the live-ledger read at a
+    # temp UNDER-cap ledger so the day-total gate stays quiet unless a test
+    # says otherwise (the REAL ~/ai-fleet ledger is over $20 today and must
+    # never leak into unit tests).
+    day_ledger = guard_dir / "bench" / "daily_spend.jsonl"
+    day_ledger.parent.mkdir(parents=True, exist_ok=True)
+    day_ledger.write_text(
+        json.dumps({"day": date.today().isoformat(), "lane": "dsh-harness",
+                    "cost_usd": 1.0}) + "\n", encoding="utf-8")
+    monkeypatch.setattr(h, "_HARD_CAP_DAY_LEDGER", day_ledger)
     yield guard_dir
 
 
@@ -127,3 +138,75 @@ def test_streaming_and_nonstreaming_entries_both_gate(tmp_path, monkeypatch):
     with pytest.raises(h.PrimarySpendCapExceeded):
         h.interruptible_streaming_api_call(DEEPSEEK, {})
     assert calls.count("deepseek") >= 2
+
+
+# ── L10 day-total hard cap (2026-09-02 spend-cap-failclosed directive) ───────
+# The $20 hard cap is ACCOUNT-wide (fleet_router + dsh-harness + hermes rows
+# on one DeepSeek account). The hourly park file and the per-lane caps were
+# both blind to it at request time on 2026-09-02 (ledger crossed $20.82 at
+# 16:54, park landed 17:54) — these tests pin the LIVE-LEDGER refusal.
+
+def _write_day_ledger(monkeypatch, tmp_path, rows):
+    p = tmp_path / "dayledger"
+    p.mkdir(exist_ok=True)
+    led = p / "daily_spend.jsonl"
+    with led.open("w", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r) + "\n")
+    monkeypatch.setattr(h, "_HARD_CAP_DAY_LEDGER", led)
+    return led
+
+
+def test_day_total_2001_refuses_before_spend_guard(tmp_path, monkeypatch):
+    """A $20.01 DeepSeek-account day PHYSICALLY refuses the call at request
+    time from the live ledger — no waiting for the hourly park file."""
+    _write_day_ledger(monkeypatch, tmp_path, [
+        {"day": date.today().isoformat(), "lane": "dsh-harness", "cost_usd": 20.01}])
+    with pytest.raises(h.PrimarySpendCapExceeded) as ei:
+        h.enforce_primary_spend_cap(DEEPSEEK)
+    msg = str(ei.value)
+    assert "hard_cap_day_total" in msg and "$20.01" in msg
+    assert ei.value.status_code == 402, "402 so the retry loop stops + billing fallback"
+
+
+def test_day_total_at_cap_refuses(tmp_path, monkeypatch):
+    """Exactly $20.00 is AT the cap -> refused (>=, not >)."""
+    _write_day_ledger(monkeypatch, tmp_path, [
+        {"day": date.today().isoformat(), "lane": "deepseek", "cost_usd": 20.0}])
+    with pytest.raises(h.PrimarySpendCapExceeded) as ei:
+        h.enforce_primary_spend_cap(DEEPSEEK)
+    assert "hard_cap_day_total" in str(ei.value)
+
+
+def test_day_total_under_cap_falls_through_to_lane_caps(tmp_path, monkeypatch):
+    """$19.99 day -> day-total gate quiet; the per-lane spend_guard check
+    still runs and its shim verdict is what refuses."""
+    _write_day_ledger(monkeypatch, tmp_path, [
+        {"day": date.today().isoformat(), "lane": "dsh-harness", "cost_usd": 19.99}])
+    with pytest.raises(h.PrimarySpendCapExceeded) as ei:
+        h.enforce_primary_spend_cap(DEEPSEEK)
+    msg = str(ei.value)
+    assert "over_daily_spend_cap" in msg
+    assert "hard_cap_day_total" not in msg
+
+
+def test_day_total_counts_only_today(tmp_path, monkeypatch):
+    """Yesterday's spend never counts against today's hard cap."""
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
+    _write_day_ledger(monkeypatch, tmp_path, [
+        {"day": yesterday, "lane": "dsh-harness", "cost_usd": 50.0},
+        {"day": date.today().isoformat(), "lane": "dsh-harness", "cost_usd": 1.0}])
+    with pytest.raises(h.PrimarySpendCapExceeded) as ei:
+        h.enforce_primary_spend_cap(DEEPSEEK)
+    msg = str(ei.value)
+    assert "over_daily_spend_cap" in msg  # lane-shim verdict, not the day total
+    assert "hard_cap_day_total" not in msg
+
+
+def test_day_total_unreadable_ledger_fails_CLOSED(tmp_path, monkeypatch):
+    """A missing/unreadable ledger refuses — cannot prove the cap open."""
+    monkeypatch.setattr(h, "_HARD_CAP_DAY_LEDGER",
+                        tmp_path / "no" / "daily_spend.jsonl")
+    with pytest.raises(h.PrimarySpendCapExceeded) as ei:
+        h.enforce_primary_spend_cap(DEEPSEEK)
+    assert "hard_cap_day_ledger_unreadable" in str(ei.value)
