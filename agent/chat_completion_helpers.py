@@ -21,9 +21,12 @@ import logging
 import math
 import os
 import re
+import subprocess
+import sys
 import threading
 import time
 import uuid
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
@@ -856,11 +859,124 @@ def direct_api_call(agent, api_kwargs: dict):
             )
 
 
+# ── PRIMARY-lane daily spend cap (2026-09-01, builder order 1) ──────────────
+# The fallback fuse gates FALLBACK activation only. The PRIMARY lane — the
+# provider a session actually runs on — was never capped inside hermes:
+# hermes-direct DeepSeek bypassed the hard caps entirely. This gate consults
+# the SAME ai-fleet spend_guard the fuse uses, at BOTH chat-completion entry
+# points, before any client is built. Fail-closed: an unreadable guard
+# refuses too — an unreadable cap is not permission to spend.
+_SPEND_GUARD_FLEET_ROOT = Path.home() / "ai-fleet"
+_SPEND_GUARD_SNIPPET = (
+    "import sys, json; from pathlib import Path; "
+    "sys.path.insert(0, sys.argv[1]); import spend_guard; "
+    "print(json.dumps(spend_guard.lane_blocked(Path(sys.argv[1]), sys.argv[2])))"
+)
+# litellm_caps hard-cap PARK (2026-09-01): ops/litellm_caps.py enforce writes
+# lane_failover.json when deepseek balance <= $0.5 OR daily spend >= $20 —
+# the FLEET-WIDE hard cap, separate from the per-lane spend_caps.json limits.
+# The gate must refuse on EITHER signal; the per-lane cap alone was blind to
+# a fleet-wide burn (measured 2026-09-01: $24.78 >= $20 parked while the
+# hermes-deepseek lane read $2.67 under its $5 cap — a hermes-direct call
+# sailed through). Read at call time; unreadable park file = fail-closed.
+_FAILOVER_STATE_PATH = _SPEND_GUARD_FLEET_ROOT / "ops" / "state" / "lane_failover.json"
+# Provider -> ledger lane. spend_guard counts the lane named in
+# bench/spend_caps.json (hermes-deepseek $5/day; deepseek $8/day). A provider
+# absent here is not capped (local/DGX/Claude-Max $0 lanes, unlisted cloud).
+_PRIMARY_SPEND_CAP_LANES = {
+    "deepseek": "hermes-deepseek",
+    "openrouter": "hermes-openrouter",
+    "gemini": "hermes-gemini",
+    "perplexity": "hermes-perplexity",
+}
+
+
+class PrimarySpendCapExceeded(Exception):
+    """A primary-lane call refused because the ledger lane is over its
+    ai-fleet daily cap. Carries status_code=402 so error_classifier routes it
+    to FailoverReason.billing (retryable=False, should_fallback=True) — the
+    retry loop stops hammering the lane; the fuse-gated fallback chain checks
+    the same caps, so it can only land on a lane that is under cap."""
+
+    status_code = 402
+
+
+def _primary_lane_cap_reason(lane: str) -> Optional[str]:
+    """Skip reason when ``lane`` is over cap today, else None. Fail-closed:
+    a guard that cannot be read returns a reason (refuse), never permission.
+
+    Test escape hatch: ``HERMES_SPEND_GUARD_OFF=1`` (set by tests/conftest.py
+    when HERMES_HOME is sandboxed) makes the gate a no-op — CI and unit tests
+    have no ~/ai-fleet checkout, and refusing there would brick every
+    routing test. Production never sets it; a missing guard refuses."""
+    if os.environ.get("HERMES_SPEND_GUARD_OFF") == "1":
+        return None
+    # HARD-CAP PARK first (litellm_caps lane_failover.json) — a fleet-wide
+    # burn parks deepseek even when this lane is under its own cap. This is
+    # the LIVE over-cap signal (measured 2026-09-01: $24.78 >= $20 while
+    # hermes-deepseek read $2.67). Unreadable park = fail-closed.
+    try:
+        if _FAILOVER_STATE_PATH.exists():
+            park = json.loads(_FAILOVER_STATE_PATH.read_text(encoding="utf-8"))
+            ds = (park.get("lanes") or {}).get("deepseek", {})
+            if ds.get("parked"):
+                return (f"hard_cap_parked:{ds.get('reason', 'deepseek parked')} "
+                        f"(lane_failover.json {park.get('ts', '?')})")
+    except Exception as exc:
+        return f"hard_cap_unreadable:{type(exc).__name__}"
+    guard = _SPEND_GUARD_FLEET_ROOT / "spend_guard.py"
+    if not guard.is_file():
+        return f"spend_guard_missing:{guard}"
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", _SPEND_GUARD_SNIPPET,
+             str(_SPEND_GUARD_FLEET_ROOT), lane],
+            capture_output=True, text=True, timeout=15,
+        )
+        if proc.returncode != 0:
+            return f"spend_guard_error:rc={proc.returncode}"
+        info = json.loads(proc.stdout.strip() or "{}")
+    except Exception as exc:
+        return f"spend_guard_unreadable:{type(exc).__name__}"
+    if info.get("blocked"):
+        return f"over_daily_spend_cap:{info.get('reason', 'blocked')}"
+    return None
+
+
+def enforce_primary_spend_cap(agent) -> None:
+    """Refuse a primary-lane API call whose ledger lane is over its daily cap.
+
+    Called at the top of both chat-completion entry points
+    (``interruptible_api_call`` / ``interruptible_streaming_api_call``), which
+    between them cover every main-loop turn. Raises
+    :class:`PrimarySpendCapExceeded` — loud, named, 402-routed to billing
+    fallback. Providers with no enforced ledger lane are untouched.
+    """
+    provider = (str(getattr(agent, "provider", "") or "")).strip().lower()
+    lane = _PRIMARY_SPEND_CAP_LANES.get(provider)
+    if not lane:
+        return
+    reason = _primary_lane_cap_reason(lane)
+    if reason is None:
+        return
+    message = (
+        f"REFUSED by the hermes primary spend cap: the '{lane}' ledger lane is "
+        f"over its ai-fleet daily cap ({reason}). Provider '{provider}' is "
+        f"blocked for the rest of today (spend_guard counts the LOCAL day). "
+        f"This cap is ENFORCED inside hermes (2026-09-01, Damien order) after "
+        f"hermes-direct DeepSeek bypassed the hard caps. To raise or clear it "
+        f"edit caps['{lane}'] in {_SPEND_GUARD_FLEET_ROOT / 'bench' / 'spend_caps.json'}. "
+        f"Falling back is allowed only through the fuse-gated chain, which "
+        f"checks the same caps."
+    )
+    logger.error("%s", message)
+    raise PrimarySpendCapExceeded(message)
+
+
 def interruptible_api_call(agent, api_kwargs: dict):
     """
     Run the API call in a background thread so the main conversation loop
     can detect interrupts without waiting for the full HTTP round-trip.
-
     Each worker thread gets its own OpenAI client instance. Interrupts only
     close that worker-local client, so retries and other requests never
     inherit a closed transport.
@@ -875,6 +991,15 @@ def interruptible_api_call(agent, api_kwargs: dict):
     # nothing at all. (Adapted from f60738a3b — the original sat beside the
     # primary spend cap, which does not exist on this main.)
     enforce_cost_saving_mode(agent)
+
+    # PRIMARY-lane daily spend cap (2026-09-01, builder order 1 — commit
+    # 7034b512eb8d target): refuse a PAID provider call when its ledger lane
+    # is over the ai-fleet daily cap, BEFORE a client is built or a thread
+    # spawned — a capped-out lane costs nothing at all. The fallback fuse
+    # only gates FALLBACK activation; the primary deepseek lane was the
+    # un-gated hole (hermes-direct bypassed hard caps). Fail-closed: an
+    # unreadable guard also refuses.
+    enforce_primary_spend_cap(agent)
 
     # Cron and other non-interactive, nested-pool contexts must not spawn the
     # interrupt worker — it wedges before the socket opens on the 2nd+ call
@@ -2827,6 +2952,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     # branches below that delegate to the non-streaming entry re-check, which
     # is harmless (the verdict is a ~60s-cached file read).
     enforce_cost_saving_mode(agent)
+
+    # PRIMARY-lane daily spend cap (2026-09-01): sibling of the non-streaming
+    # gate — a capped-out paid lane refuses before a client is built. The
+    # re-check in the delegated non-streaming path is harmless (cached read).
+    enforce_primary_spend_cap(agent)
 
     if agent._interrupt_requested:
         raise InterruptedError("Agent interrupted before streaming API call")
