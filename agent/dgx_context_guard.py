@@ -276,6 +276,20 @@ def dgx_request_guard(agent, api_kwargs: dict):
     guard.clamp_dgx_request(
         api_kwargs, config=cfg, caller_label=f"hermes:{_profile_name()}"
     )
+    # openai SDK v3 (closed typed signature, no **kwargs): a top-level
+    # max_thinking_tokens TypeErrors every :30000 call — "Completions.create()
+    # got an unexpected keyword argument" (reproduced 2026-09-02; ~150 failed
+    # commander/trove cron runs/day, Fable log). The P210 clamp injects it
+    # top-level; move it into extra_body, which the SDK spreads onto the top
+    # level of the outgoing JSON body — exactly where SGLang reads it (the
+    # clamp's own 2026-08-30 live verification: engine honors it per-request).
+    _mtt = api_kwargs.pop("max_thinking_tokens", None)
+    if _mtt is not None:
+        eb = api_kwargs.get("extra_body")
+        if not isinstance(eb, dict):
+            eb = {}
+            api_kwargs["extra_body"] = eb
+        eb["max_thinking_tokens"] = _mtt
     tokens = estimate_prompt_tokens(api_kwargs)
     is_big = tokens > cfg.big_prompt_token_threshold
     timeout_s = BIG_PROMPT_WAIT_TIMEOUT_S if is_big else WORKER_WAIT_TIMEOUT_S
