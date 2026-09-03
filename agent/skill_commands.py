@@ -775,6 +775,7 @@ def build_stacked_skill_invocation_message(
 def build_preloaded_skills_prompt(
     skill_identifiers: list[str],
     task_id: str | None = None,
+    char_budget: int | None = None,
 ) -> tuple[str, list[str], list[str]]:
     """Load one or more skills for session-wide CLI/TUI preloading.
 
@@ -786,6 +787,15 @@ def build_preloaded_skills_prompt(
     bundle-invocation gate (#59156). Without this, ``hermes -s <skill>`` or
     a deployment's ``HERMES_TUI_SKILLS`` env var could force-load a skill an
     operator disabled via ``skills.disabled``/``skills.platform_disabled``.
+
+    Args:
+        char_budget: Optional per-profile "lean worker" character cap applied
+            to the combined skill bodies (default None = OFF).  Blocks are kept
+            whole in priority order and lower-priority/overlong tails are cut
+            once the running total would exceed the budget.  None/0 leaves the
+            output byte-identical to a build without this feature.  This runs
+            once per session at prompt-build time, so it never invalidates a
+            live conversation's cached prefix.
     """
     prompt_parts: list[str] = []
     loaded_names: list[str] = []
@@ -836,5 +846,18 @@ def build_preloaded_skills_prompt(
             )
         )
         loaded_names.append(skill_name)
+
+    # Optional per-profile "lean worker" prompt diet (default OFF).  When a
+    # positive char_budget is provided, cap the combined bodies: keep whole
+    # higher-priority blocks and cut lower-priority/overlong tails so the
+    # session-wide preload stays within budget.  Runs once at prompt-build
+    # time, so enabling it never invalidates a live conversation's cached
+    # prefix.  None/0 => byte-identical to today.
+    if char_budget is not None:
+        try:
+            from agent.prompt_diet import budget_skill_blocks
+            prompt_parts = budget_skill_blocks(prompt_parts, char_budget)
+        except Exception:
+            pass  # Diet is best-effort; never break prompt assembly on it.
 
     return "\n\n".join(prompt_parts), loaded_names, missing

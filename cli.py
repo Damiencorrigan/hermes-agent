@@ -18929,9 +18929,16 @@ def main(
         # so no agent can be built with the skills missing.
         def _load_preloaded_skills() -> None:
             try:
+                # Optional per-profile "lean worker" prompt diet (default OFF):
+                # agent.lean_prompt_char_budget in config.yaml. None/0 leaves the
+                # preloaded-skill prompt byte-identical to today.
+                _diet_budget = (CLI_CONFIG.get("agent") or {}).get(
+                    "lean_prompt_char_budget"
+                )
                 cli._preload_skills_result = build_preloaded_skills_prompt(
                     parsed_skills,
                     task_id=cli.session_id,
+                    char_budget=_diet_budget,
                 )
             except Exception as exc:  # surfaced by finalize below
                 cli._preload_skills_error = exc

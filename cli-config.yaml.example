@@ -935,6 +935,15 @@ agent:
   # Default 3.
   # max_verify_nudges: 3
 
+  # Per-profile "lean worker" prompt-diet budget (default OFF). When a positive
+  # integer (characters, ~8000-10000 for a DGX-bound worker), Hermes trims this
+  # profile's persona SOUL text and caps the combined preloaded-skill bodies to
+  # that budget, so workers stop re-sending huge (~68-95K char) persona+skill
+  # system messages on every API call. Applied ONCE at prompt-build time (never
+  # as a mid-conversation edit), so prompt caching stays intact. None/0/omitted
+  # (the default) keeps today's byte-identical output.
+  # lean_prompt_char_budget: 10000
+
   # Enable verbose logging
   verbose: false
   
