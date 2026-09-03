@@ -6036,9 +6036,21 @@ def run_conversation(
                         "billing_block": _billing_block,
                     }
 
-                # For rate limits, respect the Retry-After header if present
+                # For rate limits, respect the Retry-After header if present.
+                # Also honor it for a genuine upstream 503/529 overload (e.g. an
+                # SGLang queue-full reply telling the client how long to wait), so
+                # a fleet of workers doesn't hammer a full queue with the short
+                # 60s-capped jittered backoff below and exhaust max_retries before
+                # the server drains. A Z.AI-Coding overload is deliberately excluded
+                # even though it can classify as ``overloaded``: it has its own
+                # adaptive long-backoff schedule (see below), and honoring
+                # Retry-After here would suppress that schedule.
                 _retry_after = None
-                if is_rate_limited:
+                if is_rate_limited or (
+                    not _is_zai_coding_overload
+                    and classified.reason == FailoverReason.overloaded
+                    and classified.status_code in {503, 529}
+                ):
                     _resp_headers = getattr(getattr(api_error, "response", None), "headers", None)
                     if _resp_headers and hasattr(_resp_headers, "get"):
                         _ra_raw = _resp_headers.get("retry-after") or _resp_headers.get("Retry-After")
