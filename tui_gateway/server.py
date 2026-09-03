@@ -6592,6 +6592,7 @@ def _make_agent(
         skills_prompt, loaded_skills, missing_skills = build_preloaded_skills_prompt(
             startup_skills,
             task_id=session_id or key,
+            char_budget=(cfg.get("agent") or {}).get("lean_prompt_char_budget"),
         )
         if missing_skills:
             missing_display = ", ".join(missing_skills)

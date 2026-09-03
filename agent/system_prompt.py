@@ -397,6 +397,17 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         _soul_content = _r.load_soul_md(_ctx_len)
         if _soul_content:
             _soul_content, _soul_sync_tail = _split_soul_sync_blocks(_soul_content)
+            # Optional per-profile "lean worker" prompt diet (default OFF).  When
+            # agent.lean_prompt_char_budget is a positive integer, cap the persona
+            # SOUL text to it — the FLEET-RULES/DAMIEN-RULINGS/FLEET-STATE sync
+            # tail (_soul_sync_tail) is deliberately NOT capped and renders
+            # verbatim later.  This runs once per session at prompt-build time,
+            # so enabling it never invalidates a live conversation's cached
+            # prefix.  No budget => byte-identical to today.
+            _budget = getattr(agent, "_lean_prompt_char_budget", None)
+            if _budget is not None:
+                from agent.prompt_diet import trim_persona
+                _soul_content = trim_persona(_soul_content, _budget)
             stable_parts.append(_soul_content)
             _soul_loaded = True
 

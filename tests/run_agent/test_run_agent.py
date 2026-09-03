@@ -1789,6 +1789,124 @@ class TestRetryAfterCap:
         status = self._drive_once(agent, 300)
         assert "Waiting 300.0s" in status
 
+    def test_retry_after_under_cap_is_honored(self, agent):
+        # 300s > old 120s cap but < new 600s cap → used verbatim.
+        status = self._drive_once(agent, 300)
+        assert "Waiting 300.0s" in status
+
+
+class TestRetryAfterHonorsUpstreamOverload:
+    """A genuine 503/529 upstream overload (e.g. an SGLang ``queue full`` reply)
+    carries a ``Retry-After`` header telling the client how long to wait. The
+    retry loop must honor it for that overload case exactly as it already does
+    for rate limits, so a fleet of workers hammering a full DGX queue backs off
+    instead of exhausting ``max_retries`` on short 60s-capped jittered retries.
+    Only a genuine 503/529 overload gets this treatment -- a Z.AI-Coding 429
+    overload keeps its own adaptive backoff."""
+
+    def _drive_once(self, agent, status_code, retry_after_value, message):
+        """Raise one overloaded error carrying (optionally) a ``Retry-After``
+        header and return the retry-wait status the loop reported. Interrupts
+        the backoff sleep as soon as the wait is reported so the test never
+        actually sleeps for the reported duration."""
+
+        class _OverloadError(Exception):
+            def __init__(self):
+                super().__init__(message)
+                self.status_code = status_code
+                self.response = SimpleNamespace(
+                    headers=(
+                        {"retry-after": str(retry_after_value)}
+                        if retry_after_value is not None
+                        else {}
+                    )
+                )
+
+            def __str__(self):
+                return message
+
+        def _fake_api_call(api_kwargs):
+            raise _OverloadError()
+
+        agent._interruptible_api_call = _fake_api_call
+        agent._persist_session = lambda *args, **kwargs: None
+        agent._save_trajectory = lambda *args, **kwargs: None
+
+        captured = []
+        original_buffer = agent._buffer_status
+
+        def _capture_status(msg, *args, **kwargs):
+            captured.append(msg)
+            # Break out of the incremental backoff sleep immediately rather
+            # than blocking for the reported wait.
+            if "Waiting" in msg or "Retrying in" in msg:
+                agent._interrupt_requested = True
+            return original_buffer(msg, *args, **kwargs)
+
+        agent._buffer_status = _capture_status
+        agent.run_conversation("hello")
+        return next((m for m in captured if "Waiting" in m or "Retrying in" in m), "")
+
+    def test_503_overload_retry_after_is_honored(self, agent):
+        # 503 queue-full with Retry-After 300s -> the overload path must wait the
+        # full 300s (well past the 60s jittered cap), not a short retry.
+        status = self._drive_once(
+            agent,
+            503,
+            300,
+            "Error code: 503 - Service temporarily unavailable (queue full)",
+        )
+        assert "Retrying in 300.0s" in status
+
+    def test_529_overload_retry_after_is_honored(self, agent):
+        status = self._drive_once(
+            agent, 529, 180, "Error code: 529 - Origin is overloaded"
+        )
+        assert "Retrying in 180.0s" in status
+
+    def test_503_overload_without_header_keeps_short_backoff(self, agent):
+        # No header present -> don't fabricate a long wait; retry on the normal
+        # short jittered schedule (< 100s) rather than some huge value.
+        status = self._drive_once(
+            agent, 503, None, "Error code: 503 - Service unavailable"
+        )
+        assert status.startswith("⏳ Retrying in ")
+        m = re.search(r"Retrying in ([\d.]+)s", status)
+        assert m is not None
+        assert float(m.group(1)) < 100.0
+
+    def test_zai_coding_overload_retry_after_not_honored(self):
+        """Z.AI-Coding overloads surface as HTTP 429 overloads with their own
+        adaptive backoff. A Retry-After header on one must NOT re-route it into
+        a header-driven wait -- the fix keys strictly on a genuine 503/529."""
+        with (
+            patch(
+                "run_agent.get_tool_definitions",
+                return_value=_make_tool_defs("web_search"),
+            ),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            a = AIAgent(
+                api_key="test-key-1234567890",
+                base_url="https://api.z.ai/api/coding/paas/v4",
+                model="glm-5.2-flash",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            a.client = MagicMock()
+        status = self._drive_once(
+            a,
+            429,
+            300,
+            "The service may be temporarily overloaded. (code 1305)",
+        )
+        # Its own adaptive schedule ran (first tier = short), and the 300s
+        # header was ignored rather than honored.
+        assert "Z.AI Coding overload short retry" in status
+        assert "Waiting 300.0s" not in status
+
 
 
 class TestConcurrentToolExecution:

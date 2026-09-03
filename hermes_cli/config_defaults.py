@@ -134,6 +134,16 @@ DEFAULT_CONFIG = {
         # compounds over a long conversation.  Costs ~70 tokens in the cached
         # system prompt.  Set False to disable globally.
         "parallel_tool_call_guidance": True,
+        # Per-profile "lean worker" prompt-diet budget (default-off). When set
+        # to a positive integer (characters, ~8000-10000 for a DGX-bound worker),
+        # Hermes trims this profile's persona SOUL text and caps the combined
+        # preloaded-skill bodies to that budget, so workers stop re-sending huge
+        # (~68-95K char) persona+skill system messages on every API call. Applied
+        # ONCE at prompt-build time (both injection sites run once per session),
+        # never as a mid-conversation edit, so prompt caching stays intact.
+        # None / 0 / omitted (default) leaves today's output byte-identical.
+        # See agent/prompt_diet.py.
+        "lean_prompt_char_budget": None,
         # Local-environment toolchain probe — surfaces Python/pip/uv/PEP-668
         # state in the system prompt when something non-default is detected
         # (e.g. python3 has no pip module, pip→python version mismatch, PEP

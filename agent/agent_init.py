@@ -1889,6 +1889,16 @@ def init_agent(
     # single turn; the runtime already executes such batches concurrently.
     agent._parallel_tool_call_guidance = bool(_agent_section.get("parallel_tool_call_guidance", True))
 
+    # Per-profile "lean worker" prompt-diet budget (default OFF = None).  A
+    # positive integer caps this profile's persona SOUL text and its combined
+    # preloaded-skill bodies to that many characters, so a DGX-bound worker
+    # stops re-sending ~68-95K-char system messages on every API call.  Applied
+    # once at prompt-build time (never a mid-conversation edit), so prompt
+    # caching is preserved.  The raw value is stored so the build path can
+    # resolve it through prompt_diet.coerce_char_budget (None/0 => OFF, keeping
+    # today's byte-identical output).  See agent/prompt_diet.py.
+    agent._lean_prompt_char_budget = _agent_section.get("lean_prompt_char_budget")
+
     # Local Python toolchain probe toggle.  Default True.  When False,
     # the probe is skipped entirely (no subprocess calls, no system-prompt
     # line).  Useful for users on exotic setups where the probe heuristics
