@@ -1,0 +1,5 @@
+name: dgx-sglang-provider
+kind: model-provider
+version: 1.0.0
+description: DGX SGLang canary — local OpenAI-compatible reasoning endpoint (Qwen3.8-27B)
+author: Damien Corrigan
